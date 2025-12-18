@@ -1,1 +1,1 @@
-# Asset_Generator-2D-3D-
+# Asset Generator for 2D & 3D

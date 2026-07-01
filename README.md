@@ -2,8 +2,15 @@
 
 A Blender add-on that generates 2D billboard/concept assets from text prompts and can convert them into textured 3D meshes — all in one pipeline, without leaving Blender.
 
+<img width="3154" height="1728" alt="image" src="https://github.com/user-attachments/assets/ca42e886-da6d-4f86-8967-fa71e8437fbf" />
+
 - **2D generation**: [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) generates an image per prompt line, [BiRefNet_HR](https://huggingface.co/ZhengPeng7/BiRefNet_HR) removes the background and splits multi-object images into separate cropped assets, each imported as an upright image-plane object and marked as a Blender asset.
+
+<img width="392" height="236" alt="image" src="https://github.com/user-attachments/assets/0cd52374-47d1-41e3-ab19-87edba19715f" />
+
 - **3D conversion**: selected image-plane assets are sent through [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) (Microsoft's image-to-3D pipeline) to produce a textured `.glb` mesh, imported back into the scene next to the source plane.
+
+<img width="394" height="96" alt="image" src="https://github.com/user-attachments/assets/8d0c561e-8303-4fbc-a77c-5384acdbeb72" />
 
 Both stages run in isolated background subprocesses with their own progress bar, so Blender's UI stays responsive during generation.
 
@@ -16,9 +23,11 @@ Both stages run in isolated background subprocesses with their own progress bar,
 
 ## Installation
 
-1. Copy this folder into your Blender add-ons directory (or install the repo as a zip via `Edit > Preferences > Add-ons > Install...`).
-2. Enable **"2D Asset Generator & Trellis 3D (Async Pro)"** in the add-ons list.
-3. Open its preferences and click **"Install 2D + 3D Dependencies"**. This runs in the background and:
+<img width="1286" height="436" alt="image" src="https://github.com/user-attachments/assets/dcaae510-3988-49d7-9636-0a8afc85c638" />
+
+1. Download: https://github.com/tin2tin/Asset_Generator-2D-3D/archive/refs/heads/main.zip and install the repo as a zip via `Edit > Preferences > Add-ons > Install...`).
+2. Enable **"Asset Generator (2D/3D)"** in the add-ons list.
+3. Open its preferences and click **"Install Dependencies"**. This runs in the background and:
    - Installs a CUDA-enabled PyTorch build (`torch==2.9.1+cu128`) into an isolated `addon_packages/` folder (added to `sys.path` at runtime — it does not touch Blender's own Python environment).
    - Installs the full pinned dependency set from `requirements.txt`.
    - Clones the `TRELLIS.2` repo (for the 3D pipeline code).

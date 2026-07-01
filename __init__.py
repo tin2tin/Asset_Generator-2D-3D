@@ -1,5 +1,5 @@
 bl_info = {
-    "name": "2D Asset Generator & Trellis 3D (Async Pro)",
+    "name": "Asset Generator (2D/3D)",
     "author": "tintwotin",
     "version": (5, 5),
     "blender": (5, 2, 0),

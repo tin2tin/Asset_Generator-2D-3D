@@ -4,11 +4,12 @@ bl_info = {
     "version": (5, 5),
     "blender": (5, 2, 0),
     "category": "3D View",
-    "location": "3D Editor > Sidebar > 2D Asset",
+    "location": "3D Editor > Sidebar > Asset Gen",
     "description": "Async Z-Image 2D and TRELLIS.2 3D with Fixed CUDA Extension Loading.",
 }
 
 import bpy
+import bmesh
 import os
 import re
 import subprocess
@@ -21,11 +22,14 @@ import json
 import threading
 import queue
 import stat
+import unicodedata
+import atexit
+import time
 from os.path import join
 from mathutils import Vector
 from typing import Optional
 from bpy.types import Operator, PropertyGroup, Panel, AddonPreferences
-from bpy.props import StringProperty, EnumProperty, PointerProperty, BoolProperty
+from bpy.props import StringProperty, EnumProperty, PointerProperty, BoolProperty, IntProperty, FloatProperty
 
 # --- CRITICAL ENVIRONMENT PROTECTION ---
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -123,6 +127,40 @@ def gfx_device():
     except:
         pass
     return "cpu"
+
+# --- SUBPROCESS LIFECYCLE ---
+# Model inference always runs in a child process (see ZIMAGE_OT_GenerateAsset /
+# TRELLIS_OT_ConvertSelected), so its VRAM/RAM is reclaimed by the OS the
+# instant that process exits — including on failure, since a non-zero exit
+# still tears the process down. The one case that doesn't cover is the user
+# cancelling (Esc) or quitting Blender while a subprocess is still running:
+# nothing else would ever terminate it, leaving it holding GPU memory
+# indefinitely in the background. Track live subprocesses here so both can
+# be force-cleaned.
+_ACTIVE_SUBPROCESSES = set()
+
+def _track_subprocess(proc):
+    _ACTIVE_SUBPROCESSES.add(proc)
+
+def _untrack_subprocess(proc):
+    _ACTIVE_SUBPROCESSES.discard(proc)
+
+def _terminate_subprocess(proc):
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+@atexit.register
+def _kill_active_subprocesses():
+    for proc in list(_ACTIVE_SUBPROCESSES):
+        _terminate_subprocess(proc)
 
 # --- PATH & VENV MANAGEMENT ---
 
@@ -522,7 +560,12 @@ def install_all_dependencies():
                 debug_print("TRELLIS.2 clone incomplete. Clearing repo for fresh clone...")
                 shutil.rmtree(repo_path, onerror=remove_readonly)
         if not os.path.exists(repo_path):
-            subprocess.run(["git", "clone", "--recurse-submodules", "https://github.com/microsoft/TRELLIS.2.git", repo_path], check=True)
+            # Using tin2tin's fork instead of microsoft/TRELLIS.2 directly: it carries
+            # a fix for a stale seqlen cache bug in the cascade Shape-SLat CFG-rescale
+            # path (upstream microsoft/TRELLIS.2 PR #167, not merged yet) that silently
+            # corrupts values on CUDA during cascade pipeline runs.
+            subprocess.run(["git", "clone", "--recurse-submodules", "-b", "fix-cascade-seqlen-cache",
+                             "https://github.com/tin2tin/TRELLIS.2.git", repo_path], check=True)
         else:
             subprocess.run(["git", "submodule", "update", "--init", "--recursive"], cwd=repo_path, check=True)
         done += 1
@@ -677,6 +720,25 @@ def get_unique_name(self, context):
             new_name = f"{clean} ({c})"
         context.scene.asset_name = new_name
 
+_SMART_CHAR_MAP = {
+    "‘": "'", "’": "'", "‚": "'", "‛": "'",
+    "“": '"', "”": '"', "„": '"', "‟": '"',
+    "–": "-", "—": "-", "―": "-",
+    "…": "...", " ": " ",
+}
+
+def sanitize_text(s: str) -> str:
+    # Subprocess stdout is decoded as UTF-8 by the reader threads, but the
+    # Windows console can write it in the system codepage (e.g. cp1252).
+    # Any byte from a non-ASCII character survives that mismatch and breaks
+    # the decode, so normalize common smart punctuation and drop the rest.
+    if not s:
+        return s
+    for src, dst in _SMART_CHAR_MAP.items():
+        s = s.replace(src, dst)
+    s = unicodedata.normalize("NFKD", s)
+    return s.encode("ascii", "ignore").decode("ascii")
+
 def get_unique_file_name(base_path):
     if not os.path.exists(base_path): return base_path
     base, ext = os.path.splitext(base_path)
@@ -720,23 +782,67 @@ def _read_2d_progress(proc, total):
     except Exception as e:
         debug_print(f"2D progress reader stopped: {e}")
 
+# (stage name substring, base fraction, span) within one task's build, in the
+# order o_voxel's tqdm bars print them.
+_3D_STAGE_WEIGHTS = [
+    ("Sampling sparse structure", 0.00, 0.10),
+    ("Sampling shape SLat",       0.10, 0.25),
+    ("Sampling texture SLat",     0.35, 0.15),
+    ("Building BVH",              0.50, 0.05),
+    ("Cleaning mesh",             0.55, 0.05),
+    ("Parameterizing new mesh",   0.60, 0.15),
+    ("Sampling attributes",       0.75, 0.05),
+    ("Finalizing mesh",           0.80, 0.05),
+]
+_3D_STAGE_LABELS = {
+    "Sampling sparse structure": "Sampling sparse structure",
+    "Sampling shape SLat": "Sampling shape",
+    "Sampling texture SLat": "Sampling texture",
+    "Building BVH": "Building mesh",
+    "Cleaning mesh": "Cleaning mesh",
+    "Parameterizing new mesh": "Unwrapping UVs",
+    "Sampling attributes": "Baking texture",
+    "Finalizing mesh": "Finalizing mesh",
+}
+
 def _read_3d_progress(proc):
+    # The subprocess phase is capped at 0.9 so the Blender-side per-asset
+    # import/cleanup pass (see TRELLIS_OT_ConvertSelected.modal) visibly owns
+    # the remaining 0.9-1.0 instead of the bar sitting frozen at ~99% while
+    # that phase runs unseen.
+    stage_re = re.compile(r"^(.*?):\s*(\d+)%\|")
+    proc_re = re.compile(r"Processing\s+(\d+)\s*/\s*(\d+)")
+    last_frac = 0.0
+    cur_task, total_tasks = 1, 1
     try:
         for raw in proc.stdout:
             line = raw.rstrip()
             if line:
                 print(line)
             if "Loading pipeline" in line:
-                set_progress("infer_3d", value=0.10, label="Loading TRELLIS pipeline")
-            elif "Processing" in line:
-                # Expected form: "[3d] Processing 2/5"
-                m = re.search(r"Processing\s+(\d+)\s*/\s*(\d+)", line)
-                if m:
-                    cur, tot = int(m.group(1)), max(int(m.group(2)), 1)
-                    frac = 0.10 + 0.85 * ((cur - 1) / tot)
-                    set_progress("infer_3d", value=frac, label=f"Meshing {cur}/{tot}")
-            elif "Done." in line:
-                set_progress("infer_3d", value=0.99, label="Importing")
+                last_frac = max(last_frac, 0.02)
+                set_progress("infer_3d", value=last_frac, label="Loading TRELLIS pipeline")
+                continue
+            m = proc_re.search(line)
+            if m:
+                cur_task, total_tasks = int(m.group(1)), max(int(m.group(2)), 1)
+                continue
+            sm = stage_re.match(line)
+            if sm:
+                stage_name, pct = sm.group(1).strip(), int(sm.group(2))
+                for name, base, span in _3D_STAGE_WEIGHTS:
+                    if name not in stage_name:
+                        continue
+                    local = base + span * (pct / 100.0)
+                    frac = 0.9 * ((cur_task - 1 + local) / total_tasks)
+                    label = _3D_STAGE_LABELS.get(name, name)
+                    last_frac = max(last_frac, frac)
+                    set_progress("infer_3d", value=last_frac, label=f"{label} (asset {cur_task}/{total_tasks})")
+                    break
+                continue
+            if "Done." in line:
+                last_frac = max(last_frac, 0.9)
+                set_progress("infer_3d", value=last_frac, label="Generation complete")
     except Exception as e:
         debug_print(f"3D progress reader stopped: {e}")
 
@@ -753,6 +859,8 @@ class ZIMAGE_OT_GenerateAsset(Operator):
     _result_file = ""
 
     def modal(self, context, event):
+        if event.type == 'ESC':
+            return {'CANCELLED'}
         if event.type == 'TIMER':
             tag_redraw_all(context)  # animate the progress bar
             if self._process.poll() is not None:
@@ -760,7 +868,19 @@ class ZIMAGE_OT_GenerateAsset(Operator):
                 return {'FINISHED'}
         return {'PASS_THROUGH'}
 
+    def cancel(self, context):
+        # Called on Esc (see modal) and when Blender tears the operator down
+        # for other reasons (e.g. closing the file) — either way the child
+        # process must be killed or its VRAM/RAM stays held indefinitely.
+        _terminate_subprocess(self._process)
+        _untrack_subprocess(self._process)
+        context.window_manager.event_timer_remove(self._timer)
+        set_progress("infer_2d", active=False)
+        flush()
+        tag_redraw_all(context)
+
     def process_finish(self, context):
+        _untrack_subprocess(self._process)
         context.window_manager.event_timer_remove(self._timer)
         set_progress("infer_2d", active=False)
         tag_redraw_all(context)
@@ -791,6 +911,11 @@ class ZIMAGE_OT_GenerateAsset(Operator):
         for item in results:
             bpy.ops.mesh.primitive_plane_add(size=1, location=(context.scene.cursor.location.x + item["offset"], context.scene.cursor.location.y, context.scene.cursor.location.z), rotation=(math.radians(90), 0, 0))
             obj = context.object
+            # Bake the 90° stand-up rotation into the mesh data instead of
+            # leaving it on the object transform. The Asset Browser's drag-drop
+            # placement resets object rotation to world-aligned (identity), which
+            # would otherwise flatten these planes back onto the ground.
+            bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
             obj.name = item["name"]
             img_pil = Image.open(item["path"])
             obj.scale = (img_pil.size[0] / img_pil.size[1], 1, 1)
@@ -827,6 +952,8 @@ class ZIMAGE_OT_GenerateAsset(Operator):
                 self.report({'ERROR'}, "No text-block selected.")
                 return {'CANCELLED'}
             lines = [l.body for l in text.lines if l.body.strip()]
+        lines = [sanitize_text(l).strip() for l in lines]
+        lines = [l for l in lines if l]
         if not lines:
             self.report({'ERROR'}, "No prompt text to generate from.")
             return {'CANCELLED'}
@@ -904,7 +1031,10 @@ except Exception as _e:
 raw_paths = []  # (index, path-to-raw-RGB-png)
 for i, line in enumerate(lines):
     print(f"[2d] Generating: {{line}}")
-    img = pipe(prompt="neutral background, " + line, height=1024, width=1024,
+    # 2048 instead of Z-Image's native 1024: the segmented per-object crops
+    # are what feed TRELLIS later, and crops from a 1024 sheet sit far below
+    # TRELLIS's 1024px input ceiling. Doubling the sheet doubles each crop.
+    img = pipe(prompt="neutral background, " + line, height=2048, width=2048,
                num_inference_steps=9, guidance_scale=0.0).images[0]
     raw_p = os.path.join(r"{data_dir}", f"{{name_base}}_{{i}}_raw.png")
     img.convert("RGB").save(raw_p)
@@ -968,6 +1098,7 @@ print("[2d] Done.")
             [py, "-u", script_path],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
         )
+        _track_subprocess(self._process)
         self._reader = threading.Thread(target=_read_2d_progress, args=(self._process, len(lines)), daemon=True)
         self._reader.start()
         self._timer = context.window_manager.event_timer_add(0.2, window=context.window)
@@ -975,6 +1106,37 @@ print("[2d] Done.")
         return {'RUNNING_MODAL'}
 
 # --- ASYNC OPERATOR: 3D CONVERTER (FIXED FOR BINARY LOADING) ---
+
+def _import_trellis_mesh(context, glb_path, location):
+    """Import a TRELLIS-exported GLB and return its actual mesh object.
+
+    trimesh always exports the scene graph with a root node literally named
+    "world" (its default base_frame), with the real mesh nested as a child.
+    context.active_object can land on that empty wrapper instead of the mesh,
+    so find the mesh explicitly and bake the wrapper's transform into it.
+    """
+    bpy.ops.import_scene.gltf(filepath=glb_path)
+    imported = context.selected_objects
+    mesh_obj = next((o for o in imported if o.type == 'MESH'), None)
+    if mesh_obj is None:
+        return None
+    root = mesh_obj
+    while root.parent is not None:
+        root = root.parent
+    root.location = location
+    context.view_layer.update()
+    wrappers = []
+    if mesh_obj.parent is not None:
+        node = mesh_obj.parent
+        with context.temp_override(selected_editable_objects=[mesh_obj], active_object=mesh_obj):
+            bpy.ops.object.parent_clear(type='CLEAR_KEEP_TRANSFORM')
+        while node is not None:
+            wrappers.append(node)
+            node = node.parent
+    for empty in wrappers:
+        bpy.data.objects.remove(empty, do_unlink=True)
+    return mesh_obj
+
 
 class TRELLIS_OT_ConvertSelected(Operator):
     bl_idname = "object.trellis_convert"
@@ -984,30 +1146,164 @@ class TRELLIS_OT_ConvertSelected(Operator):
     _timer = None
     _reader = None
     _tasks = []
+    _post_index = -1  # -1 while the subprocess is still running; >=0 once
+                       # per-task Blender-side post-processing has started.
 
     def modal(self, context, event):
-        if event.type == 'TIMER':
-            tag_redraw_all(context)  # animate the progress bar
-            if self._process.poll() is not None:
+        if event.type == 'ESC':
+            return {'CANCELLED'}
+        if event.type != 'TIMER':
+            return {'PASS_THROUGH'}
+        tag_redraw_all(context)  # animate the progress bar
+
+        if self._post_index < 0:
+            if self._process.poll() is None:
+                return {'PASS_THROUGH'}
+            _untrack_subprocess(self._process)
+            if self._process.returncode != 0:
                 context.window_manager.event_timer_remove(self._timer)
                 set_progress("infer_3d", active=False)
-                if self._process.returncode != 0:
-                    self.report({'ERROR'}, "3D conversion failed. See the system console for details.")
-                    flush()
-                    tag_redraw_all(context)
-                    return {'FINISHED'}
-                for t in self._tasks:
-                    glb_p = t["path"].replace(".png", "_3d.glb")
-                    if os.path.exists(glb_p):
-                        bpy.ops.import_scene.gltf(filepath=glb_p)
-                        obj = context.active_object
-                        if obj is not None:
-                            loc = t["loc"]
-                            obj.location = (loc.x, loc.y + 2.5, loc.z)
+                self.report({'ERROR'}, "3D conversion failed. See the system console for details.")
                 flush()
                 tag_redraw_all(context)
                 return {'FINISHED'}
+            # Subprocess finished — hand off to the per-task Blender-side pass
+            # below. Handled one task per tick (not one big loop) so Blender's
+            # UI actually gets to repaint the progress bar between tasks; a
+            # single blocking loop would only ever show its very last state,
+            # since bake calls block the interpreter and nothing repaints
+            # until control returns to Blender's event loop.
+            self._post_index = 0
+            return {'PASS_THROUGH'}
+
+        n = len(self._tasks)
+        if self._post_index >= n:
+            context.window_manager.event_timer_remove(self._timer)
+            set_progress("infer_3d", active=False)
+            flush()
+            tag_redraw_all(context)
+            return {'FINISHED'}
+
+        i = self._post_index
+        set_progress("infer_3d", value=0.9 + 0.1 * (i / n), label=f"Building asset {i + 1}/{n}")
+        self._process_one_task(context, self._tasks[i])
+        self._post_index += 1
         return {'PASS_THROUGH'}
+
+    def cancel(self, context):
+        # Called on Esc (see modal) and when Blender tears the operator down
+        # for other reasons (e.g. closing the file). If the subprocess is
+        # still running its VRAM/RAM would otherwise stay held indefinitely
+        # since nothing else would ever terminate it.
+        _terminate_subprocess(self._process)
+        _untrack_subprocess(self._process)
+        context.window_manager.event_timer_remove(self._timer)
+        set_progress("infer_3d", active=False)
+        flush()
+        tag_redraw_all(context)
+
+    def _process_one_task(self, context, t):
+        glb_p = t["path"].replace(".png", "_3d.glb")
+        if not os.path.exists(glb_p):
+            return
+        loc = t["loc"]
+        target_loc = (loc.x, loc.y + 2.5, loc.z)
+        mesh_obj = _import_trellis_mesh(context, glb_p, target_loc)
+        if mesh_obj is None:
+            return
+
+        context.view_layer.objects.active = mesh_obj
+        mesh_obj.select_set(True)
+
+        # The glTF importer keeps the file's per-corner normals as custom
+        # split normals, and TRELLIS exports can carry broken ones (convex
+        # shadowing artifacts). Drop them so Blender recomputes clean normals
+        # from the geometry instead.
+        if mesh_obj.data.has_custom_normals:
+            try:
+                bpy.ops.mesh.customdata_custom_splitnormals_clear()
+            except Exception as e:
+                debug_print(f"Could not clear custom normals on {mesh_obj.name}: {e}")
+
+        # Cheap insurance against voxel-decode debris (loose
+        # floaters, inconsistent winding). o_voxel's own
+        # remesh rarely leaves either, so this is normally a
+        # no-op, not an expected fix. These meshes can be dense (six-figure+
+        # vert counts), so each step is timed — a future slowdown shows up as
+        # a number in the console instead of a silent-looking freeze.
+        _t0 = time.perf_counter()
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='SELECT')
+        bpy.ops.mesh.delete_loose()
+        debug_print(f"[cleanup] delete_loose: {time.perf_counter() - _t0:.2f}s")
+
+        # Auto-flatten extreme spikes: voxel-decode/remesh debris
+        # occasionally leaves a lone vertex pulled far from its
+        # neighbors (a visible poke/needle). Detect verts whose distance
+        # from their neighbor average badly exceeds the local edge
+        # length and pull them back toward the surface. This only moves
+        # vertex positions — UVs are per-loop, not per-vertex, so
+        # texturing is unaffected. Run this before Merge by Distance so
+        # any coincident verts it creates get welded next.
+        _t0 = time.perf_counter()
+        SPIKE_FACTOR = 4.0   # how many local edge-lengths counts as "extreme"
+        SPIKE_PULL = 0.9     # how far to pull a spike toward its neighbor average (1.0 = fully flatten)
+        bm = bmesh.from_edit_mesh(mesh_obj.data)
+        bm.verts.ensure_lookup_table()
+        spikes = []
+        for v in bm.verts:
+            if len(v.link_edges) < 3:
+                continue
+            neighbors = [e.other_vert(v) for e in v.link_edges]
+            avg_edge_len = sum((v.co - n.co).length for n in neighbors) / len(neighbors)
+            if avg_edge_len < 1e-8:
+                continue
+            center = sum((n.co for n in neighbors), Vector()) / len(neighbors)
+            if (v.co - center).length > SPIKE_FACTOR * avg_edge_len:
+                spikes.append((v, center))
+        for v, center in spikes:
+            v.co = v.co.lerp(center, SPIKE_PULL)
+        bmesh.update_edit_mesh(mesh_obj.data)
+        debug_print(f"[cleanup] spike-flatten ({len(spikes)} vert(s)): {time.perf_counter() - _t0:.2f}s")
+
+        # Merge by Distance is position-only — UVs live per face-corner
+        # (loop), not per vertex, so welding two coincident vertices doesn't
+        # touch either corner's UV; it only removes the redundant vertex.
+        # A tight threshold (well under the mesh's own voxel resolution)
+        # only catches true duplicates — the kind glTF export creates at UV
+        # seams themselves, or float32 rounding noise — and leaves anything
+        # that's actually meant to stay separate untouched.
+        _t0 = time.perf_counter()
+        bpy.ops.mesh.remove_doubles(threshold=0.001)
+        debug_print(f"[cleanup] remove_doubles: {time.perf_counter() - _t0:.2f}s")
+
+        # Removed: Blender's fill_holes() has to trace and classify every
+        # boundary loop in the mesh before it can even check which ones are
+        # small enough to fill, and that trace itself hung repeatedly on
+        # these dense remeshed characters even with `sides` capped — the
+        # cost is in finding the holes, not filling them. o_voxel's own
+        # to_glb() already runs mesh.fill_holes(max_hole_perimeter=3e-2) via
+        # cumesh before this mesh ever reaches Blender, so this was
+        # redundant insurance, not a fix for an observed defect.
+
+        _t0 = time.perf_counter()
+        bpy.ops.mesh.normals_make_consistent(inside=False)
+        debug_print(f"[cleanup] normals_make_consistent: {time.perf_counter() - _t0:.2f}s")
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        # Cubic interpolation reduces perceived blur on the
+        # baked texture vs. Blender's default linear sampling.
+        for mat in mesh_obj.data.materials:
+            if mat is None or not mat.use_nodes:
+                continue
+            for node in mat.node_tree.nodes:
+                if node.type == 'TEX_IMAGE':
+                    node.interpolation = 'Cubic'
+
+        mesh_obj.asset_mark()
+        context.view_layer.update()
+        with context.temp_override(id=mesh_obj):
+            bpy.ops.ed.lib_id_load_custom_preview(filepath=t["path"])
 
     def execute(self, context):
         selected = [o for o in context.selected_objects if o.type == 'MESH']
@@ -1023,12 +1319,14 @@ class TRELLIS_OT_ConvertSelected(Operator):
                             self._tasks.append({"path": bpy.path.abspath(n.image.filepath), "loc": o.location.copy()})
         
         if not self._tasks: return {'CANCELLED'}
+        self._post_index = -1
         # Remove stale .glb outputs so a failed subprocess cannot leave us
         # re-importing results from a previous run.
         for t in self._tasks:
-            stale = t["path"].replace(".png", "_3d.glb")
-            if os.path.exists(stale):
-                os.remove(stale)
+            for suffix in ("_3d.glb", "_3d_hipoly.glb"):
+                stale = t["path"].replace(".png", suffix)
+                if os.path.exists(stale):
+                    os.remove(stale)
         py = python_exec()
         data_dir = os.path.join(bpy.utils.user_resource("DATAFILES"), "3D_Async_Queue")
         os.makedirs(data_dir, exist_ok=True)
@@ -1038,6 +1336,7 @@ class TRELLIS_OT_ConvertSelected(Operator):
         sp = packages_path()
         bin_dir = os.path.join(sp, "torch", "lib")  # CUDA runtime DLLs live here
         repo = os.path.normpath(os.path.join(addon_script_path(), "TRELLIS_REPO"))
+        scn = context.scene
 
         isolated_3d = f"""
 import sys, os
@@ -1080,6 +1379,37 @@ import torch
 from PIL import Image
 from trellis2.pipelines import Trellis2ImageTo3DPipeline
 import o_voxel
+
+# o_voxel.postprocess.to_glb() Telea-inpaints the ENTIRE unused texture atlas
+# (not just a padding border around each UV island) to avoid black seams at
+# chart edges. When the UV charts only cover a small fraction of the canvas
+# (common with cumesh's chart packing), Telea hallucinates a repeating
+# wood-grain-like pattern across all that empty space — cosmetically ugly,
+# and it can bleed into visible mip levels at chart boundaries. Bound the
+# inpaint to a small ring around real texels instead; texels farther out are
+# never sampled by the mesh anyway, so nothing is lost by leaving them as-is.
+import numpy as np
+import cv2
+_orig_cv2_inpaint = cv2.inpaint
+def _bounded_cv2_inpaint(src, inpaintMask, inpaintRadius, flags):
+    valid = (inpaintMask == 0).astype(np.uint8)
+    pad = max(int(inpaintRadius) * 4, 16)
+    kernel = np.ones((pad * 2 + 1, pad * 2 + 1), np.uint8)
+    dilated = cv2.dilate(valid, kernel)
+    band = ((dilated > 0) & (valid == 0)).astype(np.uint8)
+    filled = _orig_cv2_inpaint(src, band, inpaintRadius, flags)
+    # Real cv2.inpaint silently drops a trailing size-1 channel dim on
+    # single-channel input (metallic/roughness/alpha are (H, W, 1) -> (H, W)),
+    # and o_voxel's own code compensates with a manual `[..., None]` after the
+    # call. Mirror that exact squeeze here so this wrapper's return shape
+    # matches what the real function would have produced — matching src's
+    # shape instead would make that `[..., None]` add a spurious extra dim.
+    src2d = src if src.ndim == filled.ndim else src.squeeze(-1)
+    band_bool = band.astype(bool)
+    out = src2d.copy()
+    out[band_bool] = filled[band_bool]
+    return out
+cv2.inpaint = _bounded_cv2_inpaint
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -1131,12 +1461,36 @@ for idx, t in enumerate(tasks, 1):
     # skip background removal and go straight to crop+premultiply.
     img = Image.open(t["path"]).convert("RGBA")
     # return_latent=True gives us `res` (grid resolution) required by to_glb.
+    # Sampler params come from the UI (TRELLIS_PT_SubPanel "Advanced" box);
+    # see the scene.trellis_* properties in register().
     out_meshes, (_shape_slat, _tex_slat, res) = pipe.run(
         img,
-        seed=42,
+        seed={scn.trellis_seed},
         preprocess_image=True,
         return_latent=True,
-        pipeline_type="1024_cascade",
+        pipeline_type="{scn.trellis_pipeline_type}",
+        sparse_structure_sampler_params={{
+            "steps": {scn.trellis_ss_steps},
+            "guidance_strength": {scn.trellis_ss_guidance},
+            "guidance_rescale": {scn.trellis_ss_guidance_rescale},
+        }},
+        shape_slat_sampler_params={{
+            "steps": {scn.trellis_shape_steps},
+            "guidance_strength": {scn.trellis_shape_guidance},
+            "guidance_rescale": {scn.trellis_shape_guidance_rescale},
+        }},
+        # guidance_strength > 1 (stock: 1.0 = CFG off) trades a rescale
+        # (color/saturation drift correction) for stronger adherence to the
+        # input image.
+        tex_slat_sampler_params={{
+            "steps": {scn.trellis_tex_steps},
+            "guidance_strength": {scn.trellis_tex_guidance},
+            "guidance_rescale": {scn.trellis_tex_guidance_rescale},
+        }},
+        # Default 49152 makes the cascade silently step 1536 down (1408,
+        # 1280, ...) until the voxel token count fits — which a full-body
+        # character usually triggers.
+        max_num_tokens={scn.trellis_max_num_tokens},
     )
     mesh = out_meshes[0]
     mesh.simplify(16777216)  # nvdiffrast face limit
@@ -1149,14 +1503,23 @@ for idx, t in enumerate(tasks, 1):
         attr_layout=pipe.pbr_attr_layout,
         grid_size=res,
         aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-        decimation_target=100000,
-        texture_size=1024,
         remesh=True,
-        remesh_band=1,
-        remesh_project=0,
+        # 4096 (vs the library default of 2048): the voxel grid holds more
+        # detail than a 2048 map can carry per-texel once the UV islands are
+        # packed, and the larger map also reduces aliasing at UV seams.
+        texture_size=4096,
+        # o_voxel's own defaults (0 refine / 1 global iteration) are far
+        # weaker than cumesh.compute_charts()'s own library defaults (100 /
+        # 3) and leave the initial cone-angle clustering pass unrefined —
+        # the result is heavily over-fragmented, jagged UV charts. Matching
+        # cumesh's own defaults here lets it merge/smooth clusters properly
+        # before xatlas packs them.
+        mesh_cluster_refine_iterations=100,
+        mesh_cluster_global_iterations=3,
         use_tqdm=True,
     )
     glb.export(glb_p, extension_webp=True)
+
     del img, out_meshes, _shape_slat, _tex_slat, res, mesh, glb
     free_vram()
 
@@ -1172,11 +1535,52 @@ print("[3d] Done.")
             [py, "-u", script_path],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
         )
+        _track_subprocess(self._process)
         self._reader = threading.Thread(target=_read_3d_progress, args=(self._process,), daemon=True)
         self._reader.start()
         self._timer = context.window_manager.event_timer_add(0.2, window=context.window)
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
+
+# --- BAKE TEXTURE TO VERTEX COLORS ---
+
+class TRELLIS_OT_BakeVertexColors(Operator):
+    bl_idname = "object.bake_texture_to_vertex_colors"
+    bl_label = "Bake Texture to Vertex Colors"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        selected = [o for o in context.selected_objects if o.type == 'MESH']
+        if not selected:
+            self.report({'ERROR'}, "No mesh selected.")
+            return {'CANCELLED'}
+
+        scene = context.scene
+        prev_engine = scene.render.engine
+        scene.render.engine = 'CYCLES'
+        try:
+            for obj in selected:
+                mesh = obj.data
+                color_attr = mesh.color_attributes.get("Col")
+                if color_attr is None:
+                    color_attr = mesh.color_attributes.new(name="Col", type='BYTE_COLOR', domain='CORNER')
+                mesh.color_attributes.active_color = color_attr
+                context.view_layer.objects.active = obj
+                obj.select_set(True)
+                # DIFFUSE + COLOR-only pass filter bakes the flat albedo (the
+                # image texture's color), ignoring scene lighting entirely —
+                # target='VERTEX_COLORS' writes straight into the color
+                # attribute above instead of a separate image.
+                with context.temp_override(selected_editable_objects=[obj], active_object=obj, object=obj):
+                    bpy.ops.object.bake(type='DIFFUSE', pass_filter={'COLOR'}, target='VERTEX_COLORS')
+        except RuntimeError as e:
+            self.report({'ERROR'}, f"Bake failed: {e}")
+            return {'CANCELLED'}
+        finally:
+            scene.render.engine = prev_engine
+
+        self.report({'INFO'}, f"Baked {len(selected)} mesh(es) to vertex colors.")
+        return {'FINISHED'}
 
 # --- PRO ASYNC INSTALLER ---
 
@@ -1248,9 +1652,9 @@ class UninstallOperator(Operator):
 # --- UI PANELS ---
 
 class ZIMAGE_PT_MainPanel(Panel):
-    bl_label = "2D Asset Generator"
+    bl_label = "Asset Generator"
     bl_idname = "VIEW3D_PT_zimage"
-    bl_space_type, bl_region_type, bl_category = "VIEW_3D", "UI", "2D Asset"
+    bl_space_type, bl_region_type, bl_category = "VIEW_3D", "UI", "Asset Gen"
     def draw(self, context):
         layout = self.layout
         scene, props = context.scene, context.scene.import_text
@@ -1263,36 +1667,110 @@ class ZIMAGE_PT_MainPanel(Panel):
         else:
             box.prop(scene, "asset_prompt", text="Prompt")
             box.prop(scene, "asset_name", text="Name")
-        box.operator("object.generate_asset", text="Generate 2D Assets")
+        box.operator("object.generate_asset", text="Generate Assets")
         draw_progress(box, "infer_2d")
 
 class TRELLIS_PT_SubPanel(Panel):
     bl_label = "3D Trellis Conversion"
     bl_idname = "VIEW3D_PT_trellis"
-    bl_space_type, bl_region_type, bl_category = "VIEW_3D", "UI", "2D Asset"
+    bl_space_type, bl_region_type, bl_category = "VIEW_3D", "UI", "Asset Gen"
     def draw(self, context):
-        self.layout.operator("object.trellis_convert", text="Convert Selected to 3D", icon='MOD_MESHDEFORM')
-        draw_progress(self.layout, "infer_3d")
+        scene = context.scene
+        layout = self.layout
+        layout.operator("object.trellis_convert", text="Convert Selected to 3D", icon='MOD_MESHDEFORM')
+        draw_progress(layout, "infer_3d")
+        layout.operator("object.bake_texture_to_vertex_colors", text="Bake Texture to Vertex Colors")
+
+        box = layout.box()
+        row = box.row()
+        row.prop(scene, "trellis_show_settings",
+                 icon='TRIA_DOWN' if scene.trellis_show_settings else 'TRIA_RIGHT',
+                 icon_only=True, emboss=False, text="Advanced Settings")
+        if not scene.trellis_show_settings:
+            return
+
+        box.prop(scene, "trellis_pipeline_type")
+        box.prop(scene, "trellis_seed")
+        box.prop(scene, "trellis_max_num_tokens")
+
+        col = box.column(align=True)
+        col.label(text="Sparse Structure:")
+        col.prop(scene, "trellis_ss_steps")
+        col.prop(scene, "trellis_ss_guidance")
+        col.prop(scene, "trellis_ss_guidance_rescale")
+
+        col = box.column(align=True)
+        col.label(text="Shape:")
+        col.prop(scene, "trellis_shape_steps")
+        col.prop(scene, "trellis_shape_guidance")
+        col.prop(scene, "trellis_shape_guidance_rescale")
+
+        col = box.column(align=True)
+        col.label(text="Texture:")
+        col.prop(scene, "trellis_tex_steps")
+        col.prop(scene, "trellis_tex_guidance")
+        col.prop(scene, "trellis_tex_guidance_rescale")
 
 # --- REGISTRATION ---
 
 classes = (
     Import_Text_Props, AssetGeneratorPreferences,
-    ZIMAGE_OT_GenerateAsset, TRELLIS_OT_ConvertSelected,
+    ZIMAGE_OT_GenerateAsset, TRELLIS_OT_ConvertSelected, TRELLIS_OT_BakeVertexColors,
     InstallOperator, UninstallOperator,
     ZIMAGE_PT_MainPanel, TRELLIS_PT_SubPanel
 )
+
+# scene.trellis_* property name -> (PropertyType, kwargs). Defaults match the
+# values this addon used before these became user-editable (see the
+# isolated_3d pipe.run() call in TRELLIS_OT_ConvertSelected.execute), except
+# where noted as the pipeline's own stock config.
+_TRELLIS_SCENE_PROPS = {
+    "trellis_show_settings": (BoolProperty, dict(name="Advanced Settings", default=False)),
+    "trellis_pipeline_type": (EnumProperty, dict(
+        name="Resolution", default="1536_cascade",
+        items=[
+            ("512", "512", "Low resolution, fast, less VRAM"),
+            ("1024", "1024", "Medium resolution, no cascade"),
+            ("1024_cascade", "1024 Cascade", "Medium resolution with cascade"),
+            ("1536_cascade", "1536 Cascade", "High resolution with cascade, most VRAM"),
+        ],
+    )),
+    "trellis_seed": (IntProperty, dict(name="Seed", default=42, min=0)),
+    "trellis_max_num_tokens": (IntProperty, dict(
+        name="Max Tokens",
+        description="Max sparse-voxel tokens during cascade upsampling. Too low silently "
+                    "reduces the cascade resolution below the selected pipeline type",
+        default=65536, min=16384, max=131072, step=4096,
+    )),
+    "trellis_ss_steps": (IntProperty, dict(name="Steps", default=12, min=1, max=50)),
+    "trellis_ss_guidance": (FloatProperty, dict(name="Guidance Strength", default=7.5, min=0.0, max=20.0)),
+    "trellis_ss_guidance_rescale": (FloatProperty, dict(name="Guidance Rescale", default=0.7, min=0.0, max=1.0)),
+    "trellis_shape_steps": (IntProperty, dict(name="Steps", default=28, min=1, max=50)),
+    "trellis_shape_guidance": (FloatProperty, dict(name="Guidance Strength", default=7.5, min=0.0, max=20.0)),
+    "trellis_shape_guidance_rescale": (FloatProperty, dict(name="Guidance Rescale", default=0.5, min=0.0, max=1.0)),
+    "trellis_tex_steps": (IntProperty, dict(name="Steps", default=28, min=1, max=50)),
+    # 2.0 (stock: 1.0 = CFG off) for stronger adherence to the input image.
+    "trellis_tex_guidance": (FloatProperty, dict(name="Guidance Strength", default=2.0, min=0.0, max=20.0)),
+    # 0.7 counters the color/saturation drift plain CFG introduces at
+    # guidance_strength > 1 (stock tex default is 0.0, matching stock's
+    # CFG-off guidance_strength of 1.0).
+    "trellis_tex_guidance_rescale": (FloatProperty, dict(name="Guidance Rescale", default=0.7, min=0.0, max=1.0)),
+}
 
 def register():
     for cls in classes: bpy.utils.register_class(cls)
     bpy.types.Scene.import_text = PointerProperty(type=Import_Text_Props)
     bpy.types.Scene.asset_prompt = StringProperty(name="Prompt", default="Goofy monster character sheet, multiple poses, white background")
     bpy.types.Scene.asset_name = StringProperty(name="Asset Name", default="Asset", update=get_unique_name)
+    for name, (prop_type, kwargs) in _TRELLIS_SCENE_PROPS.items():
+        setattr(bpy.types.Scene, name, prop_type(**kwargs))
 
 def unregister():
     for cls in reversed(classes): bpy.utils.unregister_class(cls)
     del bpy.types.Scene.import_text
     del bpy.types.Scene.asset_prompt
     del bpy.types.Scene.asset_name
+    for name in _TRELLIS_SCENE_PROPS:
+        delattr(bpy.types.Scene, name)
 
 if __name__ == "__main__": register()

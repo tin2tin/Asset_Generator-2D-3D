@@ -65,10 +65,10 @@ Both panels live in the 3D Viewport sidebar, under the **"2D Asset"** tab.
 
 ## Prebuilt CUDA extensions
 
-TRELLIS.2's compiled extensions (`o-voxel`, `cumesh`, `flexgemm`, `nvdiffrast`) and `flash_attn` are ordinarily built from source against a specific CUDA Toolkit + MSVC version — impractical to ask end users to set up. Instead:
+The compiled extensions (`o-voxel`, `cumesh`, `flexgemm`, `nvdiffrast`, `flash_attn`, and `natten` — the last two shared with the Pixal3D backend) are ordinarily built from source against a specific CUDA Toolkit + MSVC version — impractical to ask end users to set up. Instead:
 
 - `o-voxel`, `cumesh`, `flexgemm`, and `nvdiffrast` wheels (built for `cu128` / `torch2.9` / `cp313` / `win_amd64`) are bundled directly in [`wheels/`](wheels/) and installed straight from there.
-- `flash_attn`'s matching wheel is ~240 MB — too large to commit to git — so it's instead downloaded on demand from the same [`PozzettiAndrea/cuda-wheels`](https://github.com/PozzettiAndrea/cuda-wheels) release index at install time.
+- `flash_attn`'s wheel (~240 MB) and `natten`'s wheel (~130 MB) are too large to commit to git — so they're instead downloaded on demand from the same [`PozzettiAndrea/cuda-wheels`](https://github.com/PozzettiAndrea/cuda-wheels) release index at install time.
 - If a bundled/remote wheel doesn't match your Python/CUDA/torch combination, the installer falls back to cloning and compiling the extension from source (requires the CUDA Toolkit and MSVC Build Tools with the C++ workload installed).
 
 ## Known limitations

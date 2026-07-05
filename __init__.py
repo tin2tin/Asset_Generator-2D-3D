@@ -533,13 +533,15 @@ def canonical_wheel_name(label, version):
     torch_tag = "torch" + ".".join(torch_base.split(".")[:2])
     return f"{project}-{version}+{cuda_tag}{torch_tag}-{py_tag}-{py_tag}-win_amd64.whl"
 
-# flash_attn's matching wheel is ~240MB — over GitHub's 100MB push limit, and
-# far bigger than the other four wheels combined (~13MB), so unlike them it is
-# NOT bundled in wheels/. Instead it is downloaded on demand straight from the
-# same PozzettiAndrea/cuda-wheels release index at install time. Building it
-# from source on Windows is not a practical fallback (hours-long compile).
+# Wheels too large to bundle in wheels/ (GitHub's 100MB push limit) are instead
+# downloaded on demand from the same PozzettiAndrea/cuda-wheels release index at
+# install time — building either from source on Windows is not a practical
+# fallback (flash_attn: hours-long compile; natten: needs the CUDA Toolkit + MSVC
+# and several hand-patched build bugs). flash_attn's wheel is ~240MB; natten's is
+# ~131MB. Each label's release is tagged "<label>-latest" (see remote_wheel_url).
 REMOTE_WHEEL_VERSION = {
     "flash_attn": "2.8.3",
+    "natten":     "0.21.6",
 }
 
 def remote_wheel_url(label):
@@ -855,6 +857,102 @@ def _req_shortname(req):
     tail = req.split("/")[-1]
     return re.split(r"[=<>;@\s]", tail)[0][:24] or req[:24]
 
+def _install_natten_from_source(py, pkgs_dir, ext_dir, wheels_dir, done, total):
+    """Clone, patch, build and install natten==0.21.6 from source, saving the
+    resulting wheel into wheels_dir for reuse. The from-source fallback for when
+    neither a bundled nor a downloadable prebuilt natten wheel is available (an
+    unusual Python/CUDA/torch combo, or the release download failed). Requires the
+    CUDA Toolkit (nvcc) + MSVC. Raises on failure; the caller logs and continues."""
+    set_progress("install", value=done / total, label="Installing natten")
+    # natten's setup.py detects our working CUDA torch and attempts the native
+    # libnatten build (it only skips straight to the pure-Python fallback when
+    # NO CUDA is available at all) — so on this machine it WILL try to compile,
+    # and needs both fixes below to have a chance of succeeding on Windows.
+    patch_torch_nvtoolsext_cmake(pkgs_dir)
+    natten_env = msvc_dev_env(os.environ)
+    cuda_home = find_cuda_home()
+    if cuda_home:
+        natten_env["CUDA_HOME"] = cuda_home
+        natten_env.setdefault("CUDA_PATH", cuda_home)
+    natten_env["PYTHONPATH"] = pkgs_dir + os.pathsep + natten_env.get("PYTHONPATH", "")
+    # natten builds libnatten.pyd with cmake directly (not setuptools), and
+    # because its CMakeLists is handed an explicit PYTHON_PATH it skips
+    # find_package(Python ... Development) and never learns where pythonXX.lib
+    # lives — so the final link fails with LNK1104: cannot open 'python313.lib'.
+    # (setuptools-based extensions don't hit this; they add the libs dir for
+    # you.) Put the interpreter's own libs dir on the linker's LIB path so
+    # link.exe can resolve the Python import library. base_prefix (not prefix)
+    # points at Blender's bundled Python root even when called from inside it.
+    py_libs = os.path.join(sys.base_prefix, "libs")
+    if os.path.isdir(py_libs):
+        natten_env["LIB"] = py_libs + os.pathsep + natten_env.get("LIB", "")
+    natten_env.setdefault("NATTEN_CUDA_ARCH", "7.5;8.0;8.6;8.9;9.0")
+    # Each translation unit instantiates many CUTLASS FNA kernel templates
+    # (backward kernels in particular) and can use several GB of RAM in
+    # cicc/ptxas; running several in parallel exhausted RAM on this machine
+    # and the OS silently killed the compiler mid-build (ninja reported
+    # "subcommand failed" with no compiler error at all — the signature of
+    # an OOM kill, not a real compile error). Building serially avoids it.
+    natten_env.setdefault("NATTEN_N_WORKERS", "1")
+    # Without this, natten's cmake build only reports pip's own opaque
+    # "still running..." heartbeat with no indication of progress or
+    # which file is being compiled. Verbose mode surfaces cmake/ninja's
+    # real per-target output (e.g. "[42/110] Building CUDA object ..."),
+    # which run_logged() now streams to both the console and the log.
+    natten_env.setdefault("NATTEN_VERBOSE", "1")
+    # Same fix as the ext_specs builds below: nvcc rejects MSVC releases newer
+    # than its own support table (fatal error C1189) unless explicitly told to
+    # tolerate them. natten's cmake invokes nvcc directly, so it hits this too.
+    natten_env["NVCC_APPEND_FLAGS"] = (
+        natten_env.get("NVCC_APPEND_FLAGS", "") + " -allow-unsupported-compiler"
+    ).strip()
+    # Installing straight from the natten==0.21.6 PyPI sdist (as before)
+    # extracts it into pip's own temp dir, giving us no chance to patch
+    # its CMakeLists.txt before the build runs. Clone the tagged release
+    # into TRELLIS_EXT instead — same pattern as cumesh/flexgemm/nvdiffrast
+    # below — so patch_natten_windows_build() can fix its Windows/MSVC
+    # CUDA-flags bug (-Wconversion) first.
+    natten_src = os.path.join(ext_dir, "natten")
+    os.makedirs(ext_dir, exist_ok=True)
+    if not os.path.exists(natten_src):
+        run_logged(
+            ["git", "clone", "--recursive", "-b", "v0.21.6",
+             "https://github.com/SHI-Labs/NATTEN.git", natten_src],
+            check=True,
+        )
+    else:
+        run_logged(["git", "submodule", "update", "--init", "--recursive"],
+                   cwd=natten_src, check=False)
+    patch_natten_windows_build(natten_src)
+    # Build a standalone .whl (rather than `pip install` directly) so
+    # the successful build can be saved into wheels/ for next time —
+    # on this machine (survives a "Nuclear Wipe" of addon_packages)
+    # and for any other user, once this file is committed alongside
+    # the addon like the other bundled wheels already are.
+    os.makedirs(wheels_dir, exist_ok=True)
+    built_dir = os.path.join(ext_dir, "_natten_wheel_out")
+    if os.path.isdir(built_dir):
+        shutil.rmtree(built_dir, onerror=remove_readonly)
+    os.makedirs(built_dir, exist_ok=True)
+    run_logged(
+        [py, "-m", "pip", "wheel", "--disable-pip-version-check", natten_src,
+         "--no-deps", "--no-build-isolation", "-w", built_dir],
+        check=True, env=natten_env,
+    )
+    import glob
+    built_wheels = glob.glob(os.path.join(built_dir, "*.whl"))
+    if not built_wheels:
+        raise RuntimeError("pip wheel reported success but produced no .whl file")
+    target_name = canonical_wheel_name("natten", "0.21.6")
+    target_path = os.path.join(wheels_dir, target_name)
+    shutil.copy2(built_wheels[0], target_path)
+    debug_print(f"Saved natten wheel for reuse: {target_name}")
+    run_logged(
+        [py, "-m", "pip", "install", "--disable-pip-version-check", target_path,
+         "--no-deps", "--upgrade", "--target", pkgs_dir],
+        check=True,
+    )
+
 def install_all_dependencies():
     """Install the full 2D + 3D stack in one pass: CUDA torch, the 2D/3D runtime
     packages, the TRELLIS.2 repo, and its compiled CUDA extensions."""
@@ -1037,97 +1135,27 @@ def install_all_dependencies():
                 )
             except Exception as e:
                 debug_print(f"natten wheel install failed: {e}")
-        else:
-            set_progress("install", value=done / total, label="Installing natten")
-            # natten's setup.py detects our working CUDA torch and attempts the native
-            # libnatten build (it only skips straight to the pure-Python fallback when
-            # NO CUDA is available at all) — so on this machine it WILL try to compile,
-            # and needs both fixes below to have a chance of succeeding on Windows.
-            patch_torch_nvtoolsext_cmake(pkgs_dir)
-            natten_env = msvc_dev_env(os.environ)
-            cuda_home = find_cuda_home()
-            if cuda_home:
-                natten_env["CUDA_HOME"] = cuda_home
-                natten_env.setdefault("CUDA_PATH", cuda_home)
-            natten_env["PYTHONPATH"] = pkgs_dir + os.pathsep + natten_env.get("PYTHONPATH", "")
-            # natten builds libnatten.pyd with cmake directly (not setuptools), and
-            # because its CMakeLists is handed an explicit PYTHON_PATH it skips
-            # find_package(Python ... Development) and never learns where pythonXX.lib
-            # lives — so the final link fails with LNK1104: cannot open 'python313.lib'.
-            # (setuptools-based extensions don't hit this; they add the libs dir for
-            # you.) Put the interpreter's own libs dir on the linker's LIB path so
-            # link.exe can resolve the Python import library. base_prefix (not prefix)
-            # points at Blender's bundled Python root even when called from inside it.
-            py_libs = os.path.join(sys.base_prefix, "libs")
-            if os.path.isdir(py_libs):
-                natten_env["LIB"] = py_libs + os.pathsep + natten_env.get("LIB", "")
-            natten_env.setdefault("NATTEN_CUDA_ARCH", "7.5;8.0;8.6;8.9;9.0")
-            # Each translation unit instantiates many CUTLASS FNA kernel templates
-            # (backward kernels in particular) and can use several GB of RAM in
-            # cicc/ptxas; running several in parallel exhausted RAM on this machine
-            # and the OS silently killed the compiler mid-build (ninja reported
-            # "subcommand failed" with no compiler error at all — the signature of
-            # an OOM kill, not a real compile error). Building serially avoids it.
-            natten_env.setdefault("NATTEN_N_WORKERS", "1")
-            # Without this, natten's cmake build only reports pip's own opaque
-            # "still running..." heartbeat with no indication of progress or
-            # which file is being compiled. Verbose mode surfaces cmake/ninja's
-            # real per-target output (e.g. "[42/110] Building CUDA object ..."),
-            # which run_logged() now streams to both the console and the log.
-            natten_env.setdefault("NATTEN_VERBOSE", "1")
-            # Same fix as the ext_specs builds below: nvcc rejects MSVC releases newer
-            # than its own support table (fatal error C1189) unless explicitly told to
-            # tolerate them. natten's cmake invokes nvcc directly, so it hits this too.
-            natten_env["NVCC_APPEND_FLAGS"] = (
-                natten_env.get("NVCC_APPEND_FLAGS", "") + " -allow-unsupported-compiler"
-            ).strip()
-            # Installing straight from the natten==0.21.6 PyPI sdist (as before)
-            # extracts it into pip's own temp dir, giving us no chance to patch
-            # its CMakeLists.txt before the build runs. Clone the tagged release
-            # into TRELLIS_EXT instead — same pattern as cumesh/flexgemm/nvdiffrast
-            # below — so patch_natten_windows_build() can fix its Windows/MSVC
-            # CUDA-flags bug (-Wconversion) first.
-            natten_src = os.path.join(ext_dir, "natten")
+        elif remote_wheel_url("natten"):
+            # No bundled/built wheel present — natten's ~131MB wheel is too large to
+            # ship in wheels/, so download the matching prebuilt one from the
+            # PozzettiAndrea/cuda-wheels release index (same mechanism as flash_attn).
+            # This avoids the CUDA Toolkit + MSVC from-source build in the common case.
+            natten_url = remote_wheel_url("natten")
+            set_progress("install", value=done / total, label="Downloading natten wheel")
+            debug_print(f"No bundled wheel for natten — downloading from {natten_url}")
             try:
-                os.makedirs(ext_dir, exist_ok=True)
-                if not os.path.exists(natten_src):
-                    run_logged(
-                        ["git", "clone", "--recursive", "-b", "v0.21.6",
-                         "https://github.com/SHI-Labs/NATTEN.git", natten_src],
-                        check=True,
-                    )
-                else:
-                    run_logged(["git", "submodule", "update", "--init", "--recursive"],
-                               cwd=natten_src, check=False)
-                patch_natten_windows_build(natten_src)
-                # Build a standalone .whl (rather than `pip install` directly) so
-                # the successful build can be saved into wheels/ for next time —
-                # on this machine (survives a "Nuclear Wipe" of addon_packages)
-                # and for any other user, once this file is committed alongside
-                # the addon like the other bundled wheels already are.
-                os.makedirs(wheels_dir, exist_ok=True)
-                built_dir = os.path.join(ext_dir, "_natten_wheel_out")
-                if os.path.isdir(built_dir):
-                    shutil.rmtree(built_dir, onerror=remove_readonly)
-                os.makedirs(built_dir, exist_ok=True)
                 run_logged(
-                    [py, "-m", "pip", "wheel", "--disable-pip-version-check", natten_src,
-                     "--no-deps", "--no-build-isolation", "-w", built_dir],
-                    check=True, env=natten_env,
-                )
-                import glob
-                built_wheels = glob.glob(os.path.join(built_dir, "*.whl"))
-                if not built_wheels:
-                    raise RuntimeError("pip wheel reported success but produced no .whl file")
-                target_name = canonical_wheel_name("natten", "0.21.6")
-                target_path = os.path.join(wheels_dir, target_name)
-                shutil.copy2(built_wheels[0], target_path)
-                debug_print(f"Saved natten wheel for reuse: {target_name}")
-                run_logged(
-                    [py, "-m", "pip", "install", "--disable-pip-version-check", target_path,
+                    [py, "-m", "pip", "install", "--disable-pip-version-check", natten_url,
                      "--no-deps", "--upgrade", "--target", pkgs_dir],
                     check=True,
                 )
+            except Exception as e:
+                debug_print(f"natten remote wheel install failed ({e}); "
+                            "falling back to from-source build.")
+                _install_natten_from_source(py, pkgs_dir, ext_dir, wheels_dir, done, total)
+        else:
+            try:
+                _install_natten_from_source(py, pkgs_dir, ext_dir, wheels_dir, done, total)
             except Exception as e:
                 debug_print(f"natten failed to install — Pixal3D's shape/texture stages need it "
                             f"and have no fallback (TRELLIS.2 backend is unaffected): {e}")

@@ -4,4 +4,6 @@
 addon_packages/
 TRELLIS_REPO/
 TRELLIS_EXT/
+PIXAL3D_REPO/
 __pycache__/
+install_log.txt

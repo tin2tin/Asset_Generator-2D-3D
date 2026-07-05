@@ -37,10 +37,78 @@ os.environ["OMP_NUM_THREADS"] = "1"
 
 DEBUG = True
 
+# --- FILE LOGGING ---
+# Install/build output (especially CUDA extension compiles) can run to tens of
+# thousands of lines — far more than a user can practically copy out of
+# Blender's system console. Mirror everything to a file inside the addon
+# folder instead, so a failure can be diagnosed by reading the file directly.
+_LOG_LOCK = threading.Lock()
+_LOG_FILE_PATH = None
+_LOG_FILE_HANDLE = None
+
+def _install_log_path():
+    return os.path.join(os.path.dirname(os.path.realpath(__file__)), "install_log.txt")
+
+def start_install_log():
+    """(Re)start the install log for a fresh run — overwrites any previous log
+    so it reflects only the most recent install attempt. Keeps one file handle
+    open for the whole run (flushed after every write) instead of reopening on
+    every line: reopening thousands of times a second during a heavy compiler
+    dump is slow and, on Windows, gives a brief window each time for another
+    process (e.g. an editor with the file open) to contend for the handle —
+    which previously could silently blackout the rest of a log mid-build."""
+    global _LOG_FILE_PATH, _LOG_FILE_HANDLE
+    stop_install_log()
+    _LOG_FILE_PATH = _install_log_path()
+    try:
+        _LOG_FILE_HANDLE = open(_LOG_FILE_PATH, "w", encoding="utf-8")
+        _LOG_FILE_HANDLE.write(f"=== Install log started {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+        _LOG_FILE_HANDLE.flush()
+    except Exception as e:
+        print(f"[2D/3D Asset Pro Log] could not create install log: {e}")
+        _LOG_FILE_HANDLE = None
+
+def stop_install_log():
+    """Close the log file handle, if one is open. Safe to call anytime."""
+    global _LOG_FILE_HANDLE
+    with _LOG_LOCK:
+        if _LOG_FILE_HANDLE is not None:
+            try:
+                _LOG_FILE_HANDLE.close()
+            except Exception:
+                pass
+            _LOG_FILE_HANDLE = None
+
+def _log_line(text):
+    """Append a line to the active install log, if any. A write failure closes
+    the stale handle and prints a visible console warning (so a log/console
+    mismatch is never silent) rather than swallowing it — the next call
+    transparently reopens in append mode and keeps going."""
+    global _LOG_FILE_HANDLE
+    if not _LOG_FILE_PATH:
+        return
+    line = text if text.endswith("\n") else text + "\n"
+    with _LOG_LOCK:
+        try:
+            if _LOG_FILE_HANDLE is None:
+                _LOG_FILE_HANDLE = open(_LOG_FILE_PATH, "a", encoding="utf-8")
+            _LOG_FILE_HANDLE.write(line)
+            _LOG_FILE_HANDLE.flush()
+        except Exception as e:
+            try:
+                _LOG_FILE_HANDLE.close()
+            except Exception:
+                pass
+            _LOG_FILE_HANDLE = None
+            print(f"[2D/3D Asset Pro Log] install log write failed (will retry next line): {e}")
+
 def debug_print(*args, **kwargs):
-    """Console logging for the generation process."""
+    """Console logging for the generation process; mirrored to install_log.txt
+    while an install log is active."""
     if DEBUG:
+        msg = " ".join(str(a) for a in args)
         print("[2D/3D Asset Pro Log] ", *args, **kwargs)
+        _log_line("[2D/3D Asset Pro Log] " + msg)
 
 # --- PROGRESS REPORTING ---
 # Background work runs in threads (installers) and subprocesses (inference),
@@ -162,6 +230,29 @@ def _kill_active_subprocesses():
     for proc in list(_ACTIVE_SUBPROCESSES):
         _terminate_subprocess(proc)
 
+def run_logged(cmd, cwd=None, env=None, check=False):
+    """subprocess.run replacement for install/build commands: streams merged
+    stdout+stderr line-by-line to the console (so live behavior in Blender's
+    system console is unchanged) while also appending every line to
+    install_log.txt. Returns a CompletedProcess-like object with .returncode."""
+    _log_line(f"$ {' '.join(str(c) for c in cmd)}" + (f"  (cwd={cwd})" if cwd else ""))
+    proc = subprocess.Popen(
+        cmd, cwd=cwd, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, encoding="utf-8", errors="replace",
+    )
+    _track_subprocess(proc)
+    try:
+        for line in proc.stdout:
+            print(line, end="")
+            _log_line(line.rstrip("\n"))
+        proc.wait()
+    finally:
+        _untrack_subprocess(proc)
+    if check and proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
+    return proc
+
 # --- PATH & VENV MANAGEMENT ---
 
 def addon_script_path() -> str:
@@ -194,6 +285,9 @@ def activate_virtualenv():
     repo_path = os.path.normpath(os.path.join(addon_script_path(), "TRELLIS_REPO"))
     if os.path.exists(repo_path) and repo_path not in sys.path:
         sys.path.insert(0, repo_path)
+    pixal3d_repo_path = os.path.normpath(os.path.join(addon_script_path(), "PIXAL3D_REPO"))
+    if os.path.exists(pixal3d_repo_path) and pixal3d_repo_path not in sys.path:
+        sys.path.insert(0, pixal3d_repo_path)
     importlib.invalidate_caches()
     return True
 
@@ -208,7 +302,7 @@ TORCH_CUDA_INDEX = "https://download.pytorch.org/whl/cu128"
 def install_cuda_torch(py, pkgs_dir):
     """Force-install the CUDA build of torch, overriding any CPU torch that a
     dependency pulled in. Returns the CompletedProcess so callers can check it."""
-    return subprocess.run(
+    return run_logged(
         [py, "-m", "pip", "install", "--disable-pip-version-check", "--target", pkgs_dir]
         + TORCH_CUDA_SPEC
         + ["--index-url", TORCH_CUDA_INDEX, "--upgrade", "--force-reinstall", "--no-deps"]
@@ -251,6 +345,19 @@ def _spec_name_version(spec):
     ('torch', '2.9.1+cu128'). Returns (spec, None) if it has no '==' pin."""
     name, sep, ver = spec.partition("==")
     return name.strip(), (ver.strip() if sep else None)
+
+def _wheel_version(wheel_path_or_url):
+    """Extract the version field from a wheel filename
+    (name-version-pytag-abitag-platformtag.whl), e.g.
+    'o_voxel-0.0.1+cu128torch2.9-cp313-cp313-win_amd64.whl' -> '0.0.1+cu128torch2.9'.
+    Handles URL-encoded '+' (%2B) in remote wheel URLs. Returns None if the
+    filename doesn't look like a wheel."""
+    import urllib.parse
+    base = urllib.parse.unquote(os.path.basename(wheel_path_or_url))
+    if not base.endswith(".whl"):
+        return None
+    parts = base[: -len(".whl")].split("-")
+    return parts[1] if len(parts) > 1 else None
 
 def dist_info_version(pkgs_dir, dist_name):
     """Return the version of `dist_name` installed under pkgs_dir, read from its
@@ -341,13 +448,90 @@ def patch_ovoxel_windows_build(src_path):
                 f.write(text)
             debug_print(f"Patched MSVC narrowing-conversion fix into {path}")
 
+def patch_pixal3d_seqlen_cache(src_path):
+    """Port tin2tin/TRELLIS.2's fix-cascade-seqlen-cache patch into the vendored
+    Pixal3D repo's copy of the same sparse-tensor module. VarLenTensor.reduce()
+    calls torch.segment_reduce(red, lengths=self.seqlen) unconditionally; in the
+    cascade Shape-SLat sampler's CFG-rescale path, x_0_pos inherits a cached
+    seqlen (via a spatial-cache-by-reference chain) computed at a different
+    scale than its actual feats, so sum(seqlen) != feats.shape[0]. CUDA's
+    segment_reduce kernel silently consumes that mismatch instead of raising,
+    corrupting shape latents on every cascade run. Recompute lengths from
+    coords when the invariant doesn't hold and evict the stale cache entry.
+    Verified present (unpatched) in pixal3d/modules/sparse/basic.py as of the
+    current TencentARC/Pixal3D master. Idempotent — safe to call on every install."""
+    target = os.path.join(src_path, "pixal3d", "modules", "sparse", "basic.py")
+    if not os.path.exists(target):
+        return
+    with open(target, "r", encoding="utf-8") as f:
+        text = f.read()
+    old = "        red = torch.segment_reduce(red, reduce=op, lengths=self.seqlen)\n        return red"
+    if old not in text:
+        return  # already patched, or upstream changed shape — don't guess
+    new = """        lengths = self.seqlen
+        n_data = red.shape[0]
+        if int(lengths.sum().item()) != n_data:
+            fresh = None
+            coords = getattr(self, 'coords', None)
+            if coords is not None and coords.shape[0] == n_data:
+                batch_size = int(coords[:, 0].max().item()) + 1 if coords.shape[0] > 0 else 1
+                fresh = torch.bincount(coords[:, 0].long(), minlength=batch_size).to(
+                    dtype=torch.long, device=red.device
+                )
+            if fresh is None or int(fresh.sum().item()) != n_data:
+                fresh = torch.tensor(
+                    [l.stop - l.start for l in self.layout],
+                    dtype=torch.long, device=red.device,
+                )
+            if hasattr(self, '_spatial_cache') and hasattr(self, '_scale'):
+                try:
+                    scale_key = str(self._scale)
+                    slot = self._spatial_cache.get(scale_key, {})
+                    for k in ('seqlen', 'cum_seqlen', 'batch_boardcast_map', 'layout'):
+                        slot.pop(k, None)
+                except Exception:
+                    pass
+            elif hasattr(self, '_cache'):
+                try:
+                    for k in ('seqlen', 'cum_seqlen', 'batch_boardcast_map'):
+                        self._cache.pop(k, None)
+                except Exception:
+                    pass
+            lengths = fresh
+            if int(lengths.sum().item()) != n_data:
+                raise RuntimeError(
+                    f"VarLenTensor.reduce: cannot reconcile seqlen "
+                    f"sum({int(lengths.sum().item())}) with data.size(0)={n_data}. "
+                    f"layout has {len(self.layout)} segments."
+                )
+        return torch.segment_reduce(red, reduce=op, lengths=lengths)"""
+    text = text.replace(old, new)
+    with open(target, "w", encoding="utf-8") as f:
+        f.write(text)
+    debug_print(f"Patched cascade seqlen-cache fix into {target}")
+
 EXT_WHEEL_PROJECT = {
     "o-voxel":    "o_voxel",
     "cumesh":     "cumesh",
     "flexgemm":   "flex_gemm",
     "nvdiffrast": "nvdiffrast",
     "flash_attn": "flash_attn",
+    "natten":     "natten",
 }
+
+def canonical_wheel_name(label, version):
+    """Build the exact bundled-wheel filename find_local_wheel() looks for, e.g.
+    'natten-0.21.6+cu128torch2.9-cp313-cp313-win_amd64.whl'. Used to save a
+    freshly-built wheel (natten, specifically — it has no upstream prebuilt
+    Windows wheel) back into wheels/ under the name that will let future
+    installs — on this machine or any other user's — find and reuse it instead
+    of rebuilding from source."""
+    project = EXT_WHEEL_PROJECT.get(label, label)
+    py_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    torch_ver = TORCH_CUDA_SPEC[0].split("==", 1)[1]  # e.g. "2.9.1+cu128"
+    torch_base, _, cuda_tag = torch_ver.partition("+")
+    torch_tag = "torch" + ".".join(torch_base.split(".")[:2])
+    return f"{project}-{version}+{cuda_tag}{torch_tag}-{py_tag}-{py_tag}-win_amd64.whl"
 
 # flash_attn's matching wheel is ~240MB — over GitHub's 100MB push limit, and
 # far bigger than the other four wheels combined (~13MB), so unlike them it is
@@ -421,6 +605,211 @@ def find_msvc():
             debug_print(f"vswhere query failed: {e}")
     return None
 
+def find_vcvarsall():
+    """Locate vcvarsall.bat for the newest installed MSVC toolchain, via vswhere.
+    Needed specifically for natten: unlike the other CUDA extensions here (o-voxel/
+    cumesh/flexgemm/nvdiffrast), which build through setuptools' torch.utils.
+    cpp_extension.BuildExtension — which finds and configures MSVC itself — natten
+    runs cmake/cl directly via its own subprocess.check_call(["cmake", ...]), so it
+    needs cl.exe/link.exe's INCLUDE/LIB/PATH pre-populated by vcvarsall.bat, which a
+    plain (non-"Developer Command Prompt") subprocess never has."""
+    if os.name != "nt":
+        return None
+    pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    vswhere = os.path.join(pf86, "Microsoft Visual Studio", "Installer", "vswhere.exe")
+    if not os.path.exists(vswhere):
+        return None
+    try:
+        r = subprocess.run(
+            [vswhere, "-latest", "-products", "*",
+             "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+             "-property", "installationPath"],
+            capture_output=True, text=True,
+        )
+        install_path = (r.stdout or "").strip()
+        if not install_path:
+            return None
+        candidate = os.path.join(install_path, "VC", "Auxiliary", "Build", "vcvarsall.bat")
+        return candidate if os.path.exists(candidate) else None
+    except Exception as e:
+        debug_print(f"vswhere query for vcvarsall.bat failed: {e}")
+        return None
+
+def msvc_dev_env(base_env):
+    """Return a copy of base_env with the MSVC x64 Developer Command Prompt
+    environment merged in, by invoking vcvarsall.bat and capturing the resulting
+    `set` output. Falls back to returning base_env unchanged if vcvarsall.bat
+    can't be found — the caller's build attempt will then surface its own error
+    rather than silently using an unconfigured environment."""
+    env = dict(base_env)
+    vcvarsall = find_vcvarsall()
+    if not vcvarsall:
+        return env
+    try:
+        r = subprocess.run(
+            f'"{vcvarsall}" x64 && set', capture_output=True, text=True, shell=True,
+        )
+        for line in (r.stdout or "").splitlines():
+            k, sep, v = line.partition("=")
+            if sep and k:
+                env[k] = v
+    except Exception as e:
+        debug_print(f"Could not source vcvarsall.bat environment: {e}")
+    return env
+
+def patch_torch_nvtoolsext_cmake(pkgs_dir):
+    """CUDA Toolkit 12.0+ dropped nvToolsExt from the Windows SDK, but torch's own
+    bundled cmake config still probes for it, which makes any CMake-based extension
+    build — natten's, specifically; the other extensions here go through setuptools'
+    own MSVC/CUDAExtension path and never touch these files — fail immediately when
+    it configures against our installed torch (documented upstream:
+    pytorch/pytorch#116926). Comment out the reference lines in torch's own cmake
+    files rather than requiring an old Windows SDK just for this. Idempotent."""
+    cmake_dir = os.path.join(pkgs_dir, "torch", "share", "cmake")
+    if not os.path.isdir(cmake_dir):
+        return
+    patched = 0
+    for root, _dirs, files in os.walk(cmake_dir):
+        for fname in files:
+            if not fname.endswith(".cmake"):
+                continue
+            fpath = os.path.join(root, fname)
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = f.readlines()
+            except OSError:
+                continue
+            changed = False
+            for i, line in enumerate(lines):
+                if "nvtoolsext" in line.lower() and not line.lstrip().startswith("#"):
+                    lines[i] = "#" + line
+                    changed = True
+            if changed:
+                with open(fpath, "w", encoding="utf-8") as f:
+                    f.writelines(lines)
+                patched += 1
+    if patched:
+        debug_print(f"Patched nvToolsExt references out of {patched} torch cmake file(s) for natten's build.")
+
+def patch_natten_windows_build(src_path):
+    """natten's csrc/CMakeLists.txt has two unguarded GCC-only warning flags in
+    CMAKE_CUDA_FLAGS, despite the file having an existing NATTEN_IS_WINDOWS
+    block for other MSVC-specific flags a few lines down:
+
+    1. `-Xcompiler=-Wconversion` — nvcc mechanically translates this into
+       `/Wconversion` for the MSVC host compiler, which isn't a recognized
+       cl.exe switch and hard-fails every translation unit with
+       `error D8021: invalid numeric argument '/Wconversion'`.
+    2. `-Xcompiler -Wall` — MSVC *does* accept a bare `-Wall`/`/Wall` (unlike
+       `-Wconversion`), so this doesn't fail the build, but it's Microsoft's
+       own "never use this" maximum warning level: dozens of purely
+       informational warnings (C4820 struct-padding, C4514/C4711
+       inlining notes, etc.) fire on every one of CUTLASS's deeply templated
+       types, whose fully-qualified names run to thousands of characters
+       each. Across ~110 translation units that's gigabytes of captured
+       warning text — which pip buffers entirely in memory to be able to
+       print on failure, and which was the actual cause of a Windows
+       Resource-Exhaustion-Detector event on this machine showing pip's own
+       python.exe process at ~80 GB virtual memory (confirmed via
+       Get-WinEvent, System log, event ID 2004) — not the compiler itself
+       needing that much RAM.
+
+    3. `not`/`and`/`or` used as C++ alternative operator tokens (e.g.
+       `if (not p.is_fully_block_sparse)` in dozens of kernel headers under
+       cuda/fna*, cuda/fmha*, cuda/tokperm, cuda/reference, plus the
+       CHECK_CONTIGUOUS macro in helpers.h) — GCC/Clang understand these
+       natively, but nvcc's own EDG front-end (used to split host/device
+       code before handing off to cl.exe) does not when targeting MSVC host
+       compatibility, and fails with its own
+       `error: identifier "not" is undefined` / `error: expected a ")"` on
+       every translation unit that includes any of those headers. Rather
+       than patch ~30 individual call sites, force-include the standard
+       <ciso646> header (which #defines these tokens) into every
+       translation unit via nvcc's own `-include` flag — the same header
+       the C++ standard itself provides for exactly this situation.
+    4. The same alternative-token problem, but for cl.exe directly:
+       natten.cpp (the one plain-C++ TU, the pybind bindings) transitively
+       includes helpers.h via fna.h etc., and natten's Windows CXX flags
+       (`/Zc:lambda /Zc:preprocessor`, copied from xformers) do NOT include
+       `/permissive-`, so cl in its default mode rejects `not` with
+       `error C2065: 'not': undeclared identifier` too. CMAKE_CUDA_FLAGS
+       never reaches cl-compiled TUs, so the nvcc fix above doesn't cover
+       this one — force-include iso646.h via cl's own `/FI` flag as well.
+       (Both fixes were verified in isolation against this machine's exact
+       nvcc 12.8 + MSVC 14.50 pair on a minimal repro before being adopted:
+       each compiler fails on `if (not x)` without its flag and compiles
+       cleanly with it.)
+    5. `error C2872: 'std': ambiguous symbol` in torch's own
+       torch/csrc/dynamo/compiled_autograd.h (pulled in by <torch/extension.h>),
+       raised by nvcc's host pass on every TU that includes it. This is NOT a
+       natten bug: a trivial `#include <torch/extension.h>` CUDA TU — even one
+       built through torch's own cpp_extension.load() — reproduces it, because
+       CUDA 12.8's nvcc front-end mis-parses the `namespace std` in the MSVC
+       14.4x/14.5x STL (both are newer than what CUDA 12.8 shipped against) and
+       ends up seeing two `std` namespaces. `-allow-unsupported-compiler`
+       silences nvcc's version *check* but not this parse failure. The other
+       CUDA extensions here dodge it only because they ship as prebuilt wheels;
+       natten is the one built from source, so it is the one that hits it.
+       Adding `/permissive-` (MSVC standards-conformance mode) to the host pass
+       resolves the ambiguity — verified to compile the previously-failing
+       reference TU *and* a CUTLASS-heavy fmha TU cleanly, with no regression.
+       (`/permissive-` also makes `not`/`and`/`or` real operators on the host,
+       but the device-side EDG parse still needs the <ciso646> include from
+       fix 3, so both are kept.)
+
+    All five are build-time-only flags; none change what gets compiled.
+    Idempotent — safe to call on every install."""
+    target = os.path.join(src_path, "csrc", "CMakeLists.txt")
+    if not os.path.exists(target):
+        return
+    with open(target, "r", encoding="utf-8") as f:
+        text = f.read()
+    changed = False
+    conversion_flag = 'set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=-Wconversion")\n'
+    if conversion_flag in text:
+        text = text.replace(conversion_flag, "")
+        changed = True
+        debug_print("Patched -Wconversion out of natten's MSVC build.")
+    wall_flag = 'set(CMAKE_CUDA_FLAGS "-Xcompiler -Wall -ldl")'
+    # Canonical target form of natten's Windows compiler-flag block, applying
+    # fixes 2-5 together. A fresh upstream clone has just the bare `wall_flag`
+    # line (no NATTEN_IS_WINDOWS guard); an already-partially-patched clone (from
+    # an earlier version of this function) has some guarded variant of it. The
+    # regex below matches any such guarded variant and normalizes it to this,
+    # so repeated calls converge here and then stop changing (idempotent).
+    target_block = (
+        'if(${NATTEN_IS_WINDOWS})\n'
+        '  set(CMAKE_CUDA_FLAGS "-ldl -include ciso646 -Xcompiler /permissive-")\n'
+        '  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /FIiso646.h")\n'
+        'else()\n'
+        '  set(CMAKE_CUDA_FLAGS "-Xcompiler -Wall -ldl")\n'
+        'endif()'
+    )
+    guarded_re = re.compile(
+        r'if\(\$\{NATTEN_IS_WINDOWS\}\)\s*\n'
+        r'\s*set\(CMAKE_CUDA_FLAGS "-ldl[^"]*"\)\s*\n'
+        r'(?:\s*set\(CMAKE_CXX_FLAGS[^\n]*\)\s*\n)?'
+        r'else\(\)\s*\n'
+        r'\s*set\(CMAKE_CUDA_FLAGS "-Xcompiler -Wall -ldl"\)\s*\n'
+        r'endif\(\)'
+    )
+    m = guarded_re.search(text)
+    if m and m.group(0) != target_block:
+        text = text[:m.start()] + target_block + text[m.end():]
+        changed = True
+        debug_print("Normalized natten's Windows compiler flags to the canonical "
+                    "fixed form (-Wall guarded out; <ciso646>/<iso646.h> for nvcc+cl "
+                    "alternative tokens; /permissive- for torch's C2872 'std' ambiguity).")
+    elif not m and wall_flag in text:
+        text = text.replace(wall_flag, target_block)
+        changed = True
+        debug_print("Applied natten's Windows compiler-flag fixes (-Wall guarded out; "
+                    "<ciso646>/<iso646.h> for nvcc+cl alternative tokens; /permissive- "
+                    "for torch's C2872 'std' ambiguity under nvcc 12.8 + MSVC 14.4x/14.5x).")
+    if changed:
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(text)
+
 def check_build_toolchain():
     """Return (ok, messages) describing whether the native build toolchain
     needed to compile the CUDA extensions (cumesh/flexgemm/o-voxel) is present:
@@ -469,6 +858,7 @@ def _req_shortname(req):
 def install_all_dependencies():
     """Install the full 2D + 3D stack in one pass: CUDA torch, the 2D/3D runtime
     packages, the TRELLIS.2 repo, and its compiled CUDA extensions."""
+    start_install_log()
     set_progress("install", value=0.0, label="Preparing...", active=True)
     try:
         activate_virtualenv()
@@ -476,6 +866,8 @@ def install_all_dependencies():
         pkgs_dir = packages_path()
         addon_dir = addon_script_path()
         repo_path = os.path.normpath(os.path.join(addon_dir, "TRELLIS_REPO"))
+        pixal3d_repo_path = os.path.normpath(os.path.join(addon_dir, "PIXAL3D_REPO"))
+        wheels_dir = os.path.join(addon_dir, "wheels")
         debug_print("Installing full 2D + 3D dependency stack...")
 
         # Warn early (before the long download) if the native build toolchain
@@ -519,8 +911,8 @@ def install_all_dependencies():
             ("nvdiffrast", ("https://github.com/NVlabs/nvdiffrast.git", "v0.4.0")),
             ("flash_attn", None),  # wheel-only (local or remote download) — see REMOTE_WHEEL_VERSION
         ]
-        # torch + each requirement + repo clone + ext builds + verify
-        total = 1 + len(reqs) + 1 + len(ext_specs) + 1
+        # torch + each requirement + repo clone + pixal3d clone + cmake + natten + ext builds + verify
+        total = 1 + len(reqs) + 1 + 1 + 1 + 1 + len(ext_specs) + 1
         done = 0
 
         # 1. Install CUDA torch FIRST (its own +cu128 index, --no-deps). It is
@@ -543,10 +935,19 @@ def install_all_dependencies():
         # 2. Everything else, one requirement at a time, all with --no-deps.
         #    Installing per line (rather than a single `-r`) keeps the progress
         #    bar informative and lets one bad line be skipped instead of
-        #    aborting the whole batch.
+        #    aborting the whole batch. Skip lines that are already satisfied at
+        #    the exact pinned version — re-running install shouldn't re-download
+        #    ~100 packages just to confirm nothing changed. Unpinned lines (the
+        #    two `git+...` entries) have no version to compare against, so those
+        #    are always re-run, same as before.
         for req in reqs:
+            name, ver = _spec_name_version(req)
+            if ver and dist_info_version(pkgs_dir, name) == ver:
+                debug_print(f"{name}=={ver} already installed — skipping")
+                done += 1
+                continue
             set_progress("install", value=done / total, label=f"Installing {_req_shortname(req)}")
-            subprocess.run([py, "-m", "pip", "install", "--disable-pip-version-check", "--target", pkgs_dir, "--no-deps", "--upgrade", req])
+            run_logged([py, "-m", "pip", "install", "--disable-pip-version-check", "--target", pkgs_dir, "--no-deps", "--upgrade", req])
             done += 1
 
         # 3. Clone / update the TRELLIS.2 repo. --recurse-submodules is required
@@ -564,10 +965,172 @@ def install_all_dependencies():
             # a fix for a stale seqlen cache bug in the cascade Shape-SLat CFG-rescale
             # path (upstream microsoft/TRELLIS.2 PR #167, not merged yet) that silently
             # corrupts values on CUDA during cascade pipeline runs.
-            subprocess.run(["git", "clone", "--recurse-submodules", "-b", "fix-cascade-seqlen-cache",
-                             "https://github.com/tin2tin/TRELLIS.2.git", repo_path], check=True)
+            run_logged(["git", "clone", "--recurse-submodules", "-b", "fix-cascade-seqlen-cache",
+                        "https://github.com/tin2tin/TRELLIS.2.git", repo_path], check=True)
         else:
-            subprocess.run(["git", "submodule", "update", "--init", "--recursive"], cwd=repo_path, check=True)
+            run_logged(["git", "submodule", "update", "--init", "--recursive"], cwd=repo_path, check=True)
+        done += 1
+
+        # 3b. Clone the Pixal3D repo (github.com/TencentARC/Pixal3D). Its `pixal3d`
+        #    package is self-contained (bundles both Trellis2ImageTo3DPipeline and
+        #    Pixal3DImageTo3DPipeline) and doesn't vendor o-voxel source itself —
+        #    TRELLIS_REPO above still supplies that. No submodules to recurse.
+        set_progress("install", value=done / total, label="Cloning Pixal3D repo")
+        if os.path.exists(pixal3d_repo_path) and not os.path.exists(os.path.join(pixal3d_repo_path, "pixal3d")):
+            debug_print("Pixal3D clone incomplete. Clearing repo for fresh clone...")
+            shutil.rmtree(pixal3d_repo_path, onerror=remove_readonly)
+        if not os.path.exists(pixal3d_repo_path):
+            run_logged(["git", "clone", "https://github.com/TencentARC/Pixal3D.git", pixal3d_repo_path], check=True)
+        # Always re-check/apply: cheap no-op once already patched (see docstring).
+        patch_pixal3d_seqlen_cache(pixal3d_repo_path)
+        done += 1
+
+        # 3c. natten (windowed/neighborhood attention). NOT just an attention-backend
+        #    knob for Pixal3D itself (that part does fall back to SDPA fine) — the
+        #    upstream valeoai/NAF upsampler that Pixal3D's shape_512/shape_1024/
+        #    tex_1024 DinoV3ProjFeatureExtractor configs pull in via torch.hub
+        #    hard-imports natten with no fallback (`from natten.functional import
+        #    na2d_av, na2d_qk`), and NAF's output width (proj_channels = embed_dim*2
+        #    when NAF is on) is baked into the pretrained checkpoint's expected
+        #    input shape — so this genuinely has to import successfully for the
+        #    Pixal3D backend's shape/texture stages to run at all.
+        #    cmake is required just for natten's setup.py to run, and isn't
+        #    otherwise part of this addon's toolchain — install it first.
+        #    natten==0.21.6 (vs. the older 0.21.0 in Pixal3D's own README) is used
+        #    deliberately: current natten gracefully falls back to a pure-PyTorch
+        #    "Flex Attention" backend when it can't build its CUDA kernels (no
+        #    cmake/MSVC dev-prompt environment needed for that path), which is a
+        #    much better bet on Windows than trying to replicate their documented
+        #    "Native Tools Command Prompt for VS" + WindowsBuilder.bat build flow.
+        if dist_info_version(pkgs_dir, "cmake") is not None:
+            debug_print("cmake already installed — skipping")
+            set_progress("install", value=done / total, label="cmake already installed")
+        else:
+            set_progress("install", value=done / total, label="Installing cmake (for natten)")
+            try:
+                run_logged(
+                    [py, "-m", "pip", "install", "--disable-pip-version-check", "cmake",
+                     "--upgrade", "--target", pkgs_dir],
+                    check=True,
+                )
+            except Exception as e:
+                debug_print(f"cmake install failed (natten's setup.py needs it to run): {e}")
+        done += 1
+
+        # natten==0.21.6 exactly — if a prior run already built and installed this
+        # exact version, its dist-info is proof the CUDA-kernel compile already
+        # succeeded, so skip re-running that multi-minute build every time.
+        natten_wheel = find_local_wheel(wheels_dir, "natten")
+        if dist_info_version(pkgs_dir, "natten") == "0.21.6":
+            debug_print("natten==0.21.6 already installed — skipping")
+            set_progress("install", value=done / total, label="natten already installed")
+        elif natten_wheel:
+            # A bundled wheel exists (either shipped with the addon, or saved by
+            # a previous build below) — install directly, no compile needed.
+            set_progress("install", value=done / total, label="Installing natten (bundled wheel)")
+            debug_print(f"Using bundled prebuilt wheel for natten: {os.path.basename(natten_wheel)}")
+            try:
+                run_logged(
+                    [py, "-m", "pip", "install", "--disable-pip-version-check", natten_wheel,
+                     "--no-deps", "--upgrade", "--target", pkgs_dir],
+                    check=True,
+                )
+            except Exception as e:
+                debug_print(f"natten wheel install failed: {e}")
+        else:
+            set_progress("install", value=done / total, label="Installing natten")
+            # natten's setup.py detects our working CUDA torch and attempts the native
+            # libnatten build (it only skips straight to the pure-Python fallback when
+            # NO CUDA is available at all) — so on this machine it WILL try to compile,
+            # and needs both fixes below to have a chance of succeeding on Windows.
+            patch_torch_nvtoolsext_cmake(pkgs_dir)
+            natten_env = msvc_dev_env(os.environ)
+            cuda_home = find_cuda_home()
+            if cuda_home:
+                natten_env["CUDA_HOME"] = cuda_home
+                natten_env.setdefault("CUDA_PATH", cuda_home)
+            natten_env["PYTHONPATH"] = pkgs_dir + os.pathsep + natten_env.get("PYTHONPATH", "")
+            # natten builds libnatten.pyd with cmake directly (not setuptools), and
+            # because its CMakeLists is handed an explicit PYTHON_PATH it skips
+            # find_package(Python ... Development) and never learns where pythonXX.lib
+            # lives — so the final link fails with LNK1104: cannot open 'python313.lib'.
+            # (setuptools-based extensions don't hit this; they add the libs dir for
+            # you.) Put the interpreter's own libs dir on the linker's LIB path so
+            # link.exe can resolve the Python import library. base_prefix (not prefix)
+            # points at Blender's bundled Python root even when called from inside it.
+            py_libs = os.path.join(sys.base_prefix, "libs")
+            if os.path.isdir(py_libs):
+                natten_env["LIB"] = py_libs + os.pathsep + natten_env.get("LIB", "")
+            natten_env.setdefault("NATTEN_CUDA_ARCH", "7.5;8.0;8.6;8.9;9.0")
+            # Each translation unit instantiates many CUTLASS FNA kernel templates
+            # (backward kernels in particular) and can use several GB of RAM in
+            # cicc/ptxas; running several in parallel exhausted RAM on this machine
+            # and the OS silently killed the compiler mid-build (ninja reported
+            # "subcommand failed" with no compiler error at all — the signature of
+            # an OOM kill, not a real compile error). Building serially avoids it.
+            natten_env.setdefault("NATTEN_N_WORKERS", "1")
+            # Without this, natten's cmake build only reports pip's own opaque
+            # "still running..." heartbeat with no indication of progress or
+            # which file is being compiled. Verbose mode surfaces cmake/ninja's
+            # real per-target output (e.g. "[42/110] Building CUDA object ..."),
+            # which run_logged() now streams to both the console and the log.
+            natten_env.setdefault("NATTEN_VERBOSE", "1")
+            # Same fix as the ext_specs builds below: nvcc rejects MSVC releases newer
+            # than its own support table (fatal error C1189) unless explicitly told to
+            # tolerate them. natten's cmake invokes nvcc directly, so it hits this too.
+            natten_env["NVCC_APPEND_FLAGS"] = (
+                natten_env.get("NVCC_APPEND_FLAGS", "") + " -allow-unsupported-compiler"
+            ).strip()
+            # Installing straight from the natten==0.21.6 PyPI sdist (as before)
+            # extracts it into pip's own temp dir, giving us no chance to patch
+            # its CMakeLists.txt before the build runs. Clone the tagged release
+            # into TRELLIS_EXT instead — same pattern as cumesh/flexgemm/nvdiffrast
+            # below — so patch_natten_windows_build() can fix its Windows/MSVC
+            # CUDA-flags bug (-Wconversion) first.
+            natten_src = os.path.join(ext_dir, "natten")
+            try:
+                os.makedirs(ext_dir, exist_ok=True)
+                if not os.path.exists(natten_src):
+                    run_logged(
+                        ["git", "clone", "--recursive", "-b", "v0.21.6",
+                         "https://github.com/SHI-Labs/NATTEN.git", natten_src],
+                        check=True,
+                    )
+                else:
+                    run_logged(["git", "submodule", "update", "--init", "--recursive"],
+                               cwd=natten_src, check=False)
+                patch_natten_windows_build(natten_src)
+                # Build a standalone .whl (rather than `pip install` directly) so
+                # the successful build can be saved into wheels/ for next time —
+                # on this machine (survives a "Nuclear Wipe" of addon_packages)
+                # and for any other user, once this file is committed alongside
+                # the addon like the other bundled wheels already are.
+                os.makedirs(wheels_dir, exist_ok=True)
+                built_dir = os.path.join(ext_dir, "_natten_wheel_out")
+                if os.path.isdir(built_dir):
+                    shutil.rmtree(built_dir, onerror=remove_readonly)
+                os.makedirs(built_dir, exist_ok=True)
+                run_logged(
+                    [py, "-m", "pip", "wheel", "--disable-pip-version-check", natten_src,
+                     "--no-deps", "--no-build-isolation", "-w", built_dir],
+                    check=True, env=natten_env,
+                )
+                import glob
+                built_wheels = glob.glob(os.path.join(built_dir, "*.whl"))
+                if not built_wheels:
+                    raise RuntimeError("pip wheel reported success but produced no .whl file")
+                target_name = canonical_wheel_name("natten", "0.21.6")
+                target_path = os.path.join(wheels_dir, target_name)
+                shutil.copy2(built_wheels[0], target_path)
+                debug_print(f"Saved natten wheel for reuse: {target_name}")
+                run_logged(
+                    [py, "-m", "pip", "install", "--disable-pip-version-check", target_path,
+                     "--no-deps", "--upgrade", "--target", pkgs_dir],
+                    check=True,
+                )
+            except Exception as e:
+                debug_print(f"natten failed to install — Pixal3D's shape/texture stages need it "
+                            f"and have no fallback (TRELLIS.2 backend is unaffected): {e}")
         done += 1
 
         # 4. Clone (if remote) and build each CUDA extension into addon_packages/.
@@ -579,7 +1142,6 @@ def install_all_dependencies():
         #    Failures are collected (not raised) so one bad build doesn't abort
         #    the others, and are surfaced in the final status line.
         os.makedirs(ext_dir, exist_ok=True)
-        wheels_dir = os.path.join(addon_dir, "wheels")
         ext_failures = []
         build_env = os.environ.copy()
         cuda_home = find_cuda_home()
@@ -606,12 +1168,18 @@ def install_all_dependencies():
             build_env.get("NVCC_APPEND_FLAGS", "") + " -allow-unsupported-compiler"
         ).strip()
         for label, source in ext_specs:
-            set_progress("install", value=done / total, label=f"Building {label}")
+            dist_name = EXT_WHEEL_PROJECT.get(label, label)
             try:
                 wheel_path = find_local_wheel(wheels_dir, label)
                 if wheel_path:
+                    target_ver = _wheel_version(wheel_path)
+                    if target_ver and dist_info_version(pkgs_dir, dist_name) == target_ver:
+                        debug_print(f"{label} {target_ver} already installed — skipping")
+                        done += 1
+                        continue
+                    set_progress("install", value=done / total, label=f"Building {label}")
                     debug_print(f"Using bundled prebuilt wheel for {label}: {os.path.basename(wheel_path)}")
-                    subprocess.run(
+                    run_logged(
                         [py, "-m", "pip", "install", "--disable-pip-version-check", wheel_path,
                          "--no-deps", "--upgrade", "--target", pkgs_dir],
                         check=True,
@@ -622,14 +1190,21 @@ def install_all_dependencies():
                     url = remote_wheel_url(label)
                     if url is None:
                         raise RuntimeError(f"no local or remote wheel configured for '{label}'")
+                    target_ver = _wheel_version(url)
+                    if target_ver and dist_info_version(pkgs_dir, dist_name) == target_ver:
+                        debug_print(f"{label} {target_ver} already installed — skipping")
+                        done += 1
+                        continue
+                    set_progress("install", value=done / total, label=f"Building {label}")
                     debug_print(f"No bundled wheel for {label} — downloading from {url}")
-                    subprocess.run(
+                    run_logged(
                         [py, "-m", "pip", "install", "--disable-pip-version-check", url,
                          "--no-deps", "--upgrade", "--target", pkgs_dir],
                         check=True,
                     )
                     done += 1
                     continue
+                set_progress("install", value=done / total, label=f"Building {label}")
                 if isinstance(source, tuple):
                     url, branch = source
                     src_path = os.path.join(ext_dir, label)
@@ -637,10 +1212,10 @@ def install_all_dependencies():
                         cmd = ["git", "clone", "--recursive", url, src_path]
                         if branch:
                             cmd[2:2] = ["-b", branch]
-                        subprocess.run(cmd, check=True)
+                        run_logged(cmd, check=True)
                     else:
-                        subprocess.run(["git", "submodule", "update", "--init", "--recursive"],
-                                       cwd=src_path, check=False)
+                        run_logged(["git", "submodule", "update", "--init", "--recursive"],
+                                   cwd=src_path, check=False)
                 else:
                     src_path = source
                 if not os.path.exists(src_path):
@@ -648,7 +1223,7 @@ def install_all_dependencies():
                 if label == "o-voxel":
                     patch_ovoxel_windows_build(src_path)
                 debug_print(f"Building extension: {label}")
-                subprocess.run(
+                run_logged(
                     [py, "-m", "pip", "install", "--disable-pip-version-check", src_path,
                      "--no-deps", "--no-build-isolation", "--upgrade", "--target", pkgs_dir],
                     check=True, env=build_env,
@@ -757,28 +1332,99 @@ def get_unique_file_name(base_path):
 def _read_2d_progress(proc, total):
     # Generation runs first (Phase 1), then segmentation (Phase 2); each phase
     # gets roughly half the bar so it never jumps backwards when the segmenter
-    # loads after all images are generated.
+    # loads after all images are generated. On a first-ever run each phase's
+    # checkpoint downloads from HuggingFace before that phase's work starts
+    # (Z-Image-Turbo in Phase 1, BiRefNet in Phase 2); each download is given a
+    # visible sub-slice of its phase, driven off HF's tqdm output. On a cached
+    # run no download is seen and each phase uses its full range exactly as
+    # before, filling smoothly from the phase's start.
+    stage_re = re.compile(r"^(.*?):\s*(\d+)%\|")
+    # HF's outer "Fetching N files:" bar — the authoritative overall download %.
+    fetch_re = re.compile(r"Fetching\s+\d+\s+files:\s*(\d+)%")
+    # tqdm's trailing transfer rate, e.g. ", 60.0MB/s]" (byte units only, so it
+    # never matches a diffusion denoising bar's "it/s" rate).
+    rate_re = re.compile(r",\s*([\d.]+\s*[kKMGT]?i?B/s)")
+    # Per-phase (download-band start, download-band end / work-band start,
+    # work-band end). Generation work spans P1_MID..P1_END when a download was
+    # seen, else 0.05..P1_END; likewise for segmentation.
+    P1_DL0, P1_MID, P1_END = 0.02, 0.22, 0.50
+    P2_DL0, P2_MID, P2_END = 0.50, 0.56, 0.95
+    last_frac = 0.0
+    gen = seg = 0
+    phase = 1                        # 1 = generation side, 2 = segmentation side
+    work_started = False             # this phase's real work has begun (past dl)
+    fetch_seen = False               # outer "Fetching N files" bar is driving %
+    dl_seen = {1: False, 2: False}   # a download happened in each phase
+    dl_desc = ""
+
+    def _emit(frac, label):
+        nonlocal last_frac
+        last_frac = max(last_frac, frac)
+        set_progress("infer_2d", value=last_frac, label=label)
+
+    def _dl_label():
+        return "Downloading model weights" + (f": {dl_desc}" if dl_desc else "")
+
     try:
-        gen = 0
-        seg = 0
         for raw in proc.stdout:
             line = raw.rstrip()
             if line:
                 print(line)
             if "Loading pipeline" in line:
-                set_progress("infer_2d", value=0.03, label="Loading image model")
-            elif "Generating:" in line:
+                phase, work_started, fetch_seen, dl_desc = 1, False, False, ""
+                _emit(0.02, "Loading image model")
+                continue
+            if "Loading BiRefNet" in line:
+                phase, work_started, fetch_seen, dl_desc = 2, False, False, ""
+                _emit(0.50, "Loading segmenter")
+                continue
+            if "Generating:" in line:
+                work_started = True
                 gen += 1
-                frac = 0.05 + 0.45 * (gen / max(total, 1))
-                set_progress("infer_2d", value=frac, label=f"Generating {gen}/{total}")
-            elif "Loading BiRefNet" in line:
-                set_progress("infer_2d", value=0.50, label="Loading segmenter")
-            elif "Segmenting:" in line:
+                base = P1_MID if dl_seen[1] else 0.05
+                _emit(base + (P1_END - base) * (gen / max(total, 1)), f"Generating {gen}/{total}")
+                continue
+            if "Segmenting:" in line:
+                work_started = True
                 seg += 1
-                frac = 0.50 + 0.45 * (seg / max(total, 1))
-                set_progress("infer_2d", value=frac, label=f"Segmenting {seg}/{total}")
-            elif "Done." in line:
-                set_progress("infer_2d", value=0.99, label="Finalizing")
+                base = P2_MID if dl_seen[2] else 0.50
+                _emit(base + (P2_END - base) * (seg / max(total, 1)), f"Segmenting {seg}/{total}")
+                continue
+            if "Done." in line:
+                _emit(0.99, "Finalizing")
+                continue
+            # --- HuggingFace checkpoint download bars (only before the phase's
+            # own work begins; a denoising/sampling tqdm bar during generation is
+            # never a download). ---
+            if work_started:
+                continue
+            dl0, dl1 = (P1_DL0, P1_MID) if phase == 1 else (P2_DL0, P2_MID)
+            fm = fetch_re.search(line)
+            if fm:
+                dl_seen[phase] = fetch_seen = True
+                lbl = _dl_label()
+                rm = rate_re.search(line)
+                if rm:
+                    lbl += f" ({rm.group(1).replace(' ', '')})"
+                _emit(dl0 + (dl1 - dl0) * (int(fm.group(1)) / 100.0), lbl)
+                continue
+            sm = stage_re.match(line)
+            if sm:
+                dl_seen[phase] = True
+                dl_desc, pct = sm.group(1).strip(), int(sm.group(2))
+                lbl = _dl_label() + f" ({pct}%)"
+                rm = rate_re.search(line)
+                if rm:
+                    lbl += f" - {rm.group(1).replace(' ', '')}"
+                # Until the outer "Fetching N files" bar takes over, drive the
+                # download band off this file's own %, capped just under the band
+                # end so one finished file can't claim the whole phase before the
+                # remaining files are known. _emit's max() keeps the bar from
+                # moving backward as each successive file resets to 0%.
+                if not fetch_seen:
+                    _emit(dl0 + (dl1 - dl0) * 0.95 * (pct / 100.0), lbl)
+                else:
+                    set_progress("infer_2d", value=last_frac, label=lbl)
     except Exception as e:
         debug_print(f"2D progress reader stopped: {e}")
 
@@ -806,22 +1452,68 @@ _3D_STAGE_LABELS = {
 }
 
 def _read_3d_progress(proc):
-    # The subprocess phase is capped at 0.9 so the Blender-side per-asset
-    # import/cleanup pass (see TRELLIS_OT_ConvertSelected.modal) visibly owns
-    # the remaining 0.9-1.0 instead of the bar sitting frozen at ~99% while
-    # that phase runs unseen.
+    # Progress model: on a first-ever run the multi-GB checkpoint download
+    # (several files from microsoft/TRELLIS.2-4B or TencentARC/Pixal3D) dominates
+    # wall-clock time, so once a download is detected it is given a real, visible
+    # slice of the bar (0.0-DL_SLICE) driven off huggingface_hub's tqdm output,
+    # and the generation stages are remapped into DL_SLICE-0.9. On a cached run
+    # no download is seen, so generation keeps the full 0.0-0.9 range and the bar
+    # fills smoothly from zero. The subprocess phase is capped at 0.9 so the
+    # Blender-side per-asset import/cleanup pass (see
+    # TRELLIS_OT_ConvertSelected.modal) visibly owns the remaining 0.9-1.0.
+    DL_SLICE = 0.30
     stage_re = re.compile(r"^(.*?):\s*(\d+)%\|")
     proc_re = re.compile(r"Processing\s+(\d+)\s*/\s*(\d+)")
+    # huggingface_hub's outer "Fetching N files:" tqdm bar — the authoritative
+    # overall download percentage across every file in the repo snapshot.
+    fetch_re = re.compile(r"Fetching\s+\d+\s+files:\s*(\d+)%")
+    # tqdm's trailing transfer rate, e.g. ", 60.0MB/s]". Byte units only, so it
+    # never matches a generation sampling bar's "it/s" rate.
+    rate_re = re.compile(r",\s*([\d.]+\s*[kKMGT]?i?B/s)")
     last_frac = 0.0
     cur_task, total_tasks = 1, 1
+    download_seen = False   # a checkpoint download has started this run
+    fetch_seen = False      # the outer "Fetching N files" bar is driving the %
+    dl_desc = ""            # current file being fetched (for the label)
+
+    def _dl_label():
+        return "Downloading model weights" + (f": {dl_desc}" if dl_desc else "")
+
     try:
         for raw in proc.stdout:
             line = raw.rstrip()
             if line:
                 print(line)
             if "Loading pipeline" in line:
+                last_frac = max(last_frac, 0.01)
+                set_progress("infer_3d", value=last_frac, label="Loading pipeline")
+                continue
+            # Backend-selection banners print once at import time (before any
+            # checkpoint download starts) — surfacing them keeps the bar moving
+            # instead of sitting static on "Loading pipeline" for a while.
+            if "[SPARSE] Conv backend" in line:
                 last_frac = max(last_frac, 0.02)
-                set_progress("infer_3d", value=last_frac, label="Loading TRELLIS pipeline")
+                set_progress("infer_3d", value=last_frac, label=line.strip())
+                continue
+            if "[ATTENTION] Using backend" in line:
+                last_frac = max(last_frac, 0.03)
+                set_progress("infer_3d", value=last_frac, label=line.strip())
+                continue
+            if "Downloading" in line and "checkpoint" in line:
+                download_seen = True
+                last_frac = max(last_frac, 0.04)
+                set_progress("infer_3d", value=last_frac, label="Downloading model weights...")
+                continue
+            # Outer HF snapshot bar: the real overall download percentage.
+            fm = fetch_re.search(line)
+            if fm:
+                download_seen = fetch_seen = True
+                last_frac = max(last_frac, DL_SLICE * (int(fm.group(1)) / 100.0))
+                lbl = _dl_label()
+                rm = rate_re.search(line)
+                if rm:
+                    lbl += f" ({rm.group(1).replace(' ', '')})"
+                set_progress("infer_3d", value=last_frac, label=lbl)
                 continue
             m = proc_re.search(line)
             if m:
@@ -830,15 +1522,38 @@ def _read_3d_progress(proc):
             sm = stage_re.match(line)
             if sm:
                 stage_name, pct = sm.group(1).strip(), int(sm.group(2))
+                matched = False
                 for name, base, span in _3D_STAGE_WEIGHTS:
                     if name not in stage_name:
                         continue
                     local = base + span * (pct / 100.0)
-                    frac = 0.9 * ((cur_task - 1 + local) / total_tasks)
+                    # Reserve 0.0-DL_SLICE for the first-run download when one was
+                    # seen; otherwise generation owns the whole 0.0-0.9 range.
+                    gen_base = DL_SLICE if download_seen else 0.0
+                    frac = gen_base + (0.9 - gen_base) * ((cur_task - 1 + local) / total_tasks)
                     label = _3D_STAGE_LABELS.get(name, name)
                     last_frac = max(last_frac, frac)
                     set_progress("infer_3d", value=last_frac, label=f"{label} (asset {cur_task}/{total_tasks})")
+                    matched = True
                     break
+                if not matched:
+                    # A huggingface_hub per-file download tqdm bar (e.g.
+                    # "model.safetensors: 45%|..."). Use it for the descriptive
+                    # label + transfer rate, and — until the outer "Fetching N
+                    # files" bar takes over — to drive the download slice off this
+                    # file's own %. Capped just under DL_SLICE so a single finished
+                    # file never claims the whole phase before the remaining files
+                    # are known; last_frac's max() guard keeps the bar from moving
+                    # backward as each successive file's bar resets to 0%.
+                    download_seen = True
+                    dl_desc = stage_name
+                    lbl = _dl_label() + f" ({pct}%)"
+                    rm = rate_re.search(line)
+                    if rm:
+                        lbl += f" - {rm.group(1).replace(' ', '')}"
+                    if not fetch_seen:
+                        last_frac = max(last_frac, DL_SLICE * 0.95 * (pct / 100.0))
+                    set_progress("infer_3d", value=last_frac, label=lbl)
                 continue
             if "Done." in line:
                 last_frac = max(last_frac, 0.9)
@@ -1097,6 +1812,7 @@ print("[2d] Done.")
         self._process = subprocess.Popen(
             [py, "-u", script_path],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+            encoding="utf-8", errors="replace",
         )
         _track_subprocess(self._process)
         self._reader = threading.Thread(target=_read_2d_progress, args=(self._process, len(lines)), daemon=True)
@@ -1336,9 +2052,32 @@ class TRELLIS_OT_ConvertSelected(Operator):
         sp = packages_path()
         bin_dir = os.path.join(sp, "torch", "lib")  # CUDA runtime DLLs live here
         repo = os.path.normpath(os.path.join(addon_script_path(), "TRELLIS_REPO"))
+        pixal3d_repo = os.path.normpath(os.path.join(addon_script_path(), "PIXAL3D_REPO"))
         scn = context.scene
 
-        isolated_3d = f"""
+        if scn.trellis_model_backend == "PIXAL3D":
+            isolated_3d = self._build_pixal3d_script(sp, bin_dir, pixal3d_repo, task_json, scn)
+        else:
+            isolated_3d = self._build_trellis2_script(sp, bin_dir, repo, task_json, scn)
+
+        script_path = os.path.join(data_dir, "run_3d.py")
+        with open(script_path, "w") as f: f.write(isolated_3d)
+        set_progress("infer_3d", value=0.0, label="Starting...", active=True)
+        # -u: unbuffered child stdout so progress markers arrive in real time.
+        self._process = subprocess.Popen(
+            [py, "-u", script_path],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+            encoding="utf-8", errors="replace",
+        )
+        _track_subprocess(self._process)
+        self._reader = threading.Thread(target=_read_3d_progress, args=(self._process,), daemon=True)
+        self._reader.start()
+        self._timer = context.window_manager.event_timer_add(0.2, window=context.window)
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def _build_trellis2_script(self, sp, bin_dir, repo, task_json, scn):
+        return f"""
 import sys, os
 
 # PATH SETUP — must happen before any non-stdlib import so addon_packages
@@ -1451,6 +2190,7 @@ def _patched_extract_features(self, image):
 _dinov3_mod.DinoV3FeatureExtractor.extract_features = _patched_extract_features
 
 print("[3d] Loading pipeline...")
+print("[3d] Downloading checkpoint if not already cached (microsoft/TRELLIS.2-4B, first run only)...")
 pipe = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
 pipe.low_vram = True
 pipe.to(device)
@@ -1527,60 +2267,253 @@ del pipe
 free_vram()
 print("[3d] Done.")
 """
-        script_path = os.path.join(data_dir, "run_3d.py")
-        with open(script_path, "w") as f: f.write(isolated_3d)
-        set_progress("infer_3d", value=0.0, label="Starting...", active=True)
-        # -u: unbuffered child stdout so progress markers arrive in real time.
-        self._process = subprocess.Popen(
-            [py, "-u", script_path],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-        )
-        _track_subprocess(self._process)
-        self._reader = threading.Thread(target=_read_3d_progress, args=(self._process,), daemon=True)
-        self._reader.start()
-        self._timer = context.window_manager.event_timer_add(0.2, window=context.window)
-        context.window_manager.modal_handler_add(self)
-        return {'RUNNING_MODAL'}
+
+    def _build_pixal3d_script(self, sp, bin_dir, pixal3d_repo, task_json, scn):
+        return f"""
+import sys, os
+
+# PATH SETUP — must happen before any non-stdlib import so addon_packages
+# takes priority over Blender's own site-packages for every subsequent import.
+sp, bin_dir, pixal3d_repo = r"{sp}", r"{bin_dir}", r"{pixal3d_repo}"
+sys.path.insert(0, pixal3d_repo)
+sys.path.insert(0, sp)  # sp at 0 so addon_packages wins over repo and Blender
+
+if hasattr(os, "add_dll_directory"):
+    os.add_dll_directory(sp)
+    if os.path.exists(bin_dir):           # torch/lib/ — CUDA runtime DLLs
+        os.add_dll_directory(bin_dir)
+    for _r, _d, _f in os.walk(sp):
+        if any(n.endswith(('.pyd', '.dll')) for n in _f):
+            try:
+                os.add_dll_directory(_r)
+            except Exception:
+                pass
+
+import json
+import gc
+import math
+
+# CRITICAL: Set env vars BEFORE any pixal3d import (modules read them at import time)
+os.environ.setdefault("ATTN_BACKEND", "sdpa")
+os.environ.setdefault("SPARSE_ATTN_BACKEND", "sdpa")
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
+# Enable flex_gemm sparse conv backend if the extension was built
+try:
+    import flex_gemm  # noqa: F401
+    os.environ.setdefault("SPARSE_CONV_BACKEND", "flex_gemm")
+except ImportError:
+    os.environ.setdefault("SPARSE_CONV_BACKEND", "none")
+
+# MANDATORY: Import Torch FIRST to load CUDA runtime for cumesh/flexgemm/natten
+import torch
+from PIL import Image
+from pixal3d.pipelines import Pixal3DImageTo3DPipeline
+import o_voxel
+import numpy as np
+
+# Same bounded-inpaint fix as the TRELLIS.2 path: o_voxel.postprocess.to_glb()
+# Telea-inpaints the ENTIRE unused texture atlas rather than just a border
+# around each UV island, which hallucinates a wood-grain pattern over empty
+# canvas. Bound it to a small ring around real texels instead.
+import cv2
+_orig_cv2_inpaint = cv2.inpaint
+def _bounded_cv2_inpaint(src, inpaintMask, inpaintRadius, flags):
+    valid = (inpaintMask == 0).astype(np.uint8)
+    pad = max(int(inpaintRadius) * 4, 16)
+    kernel = np.ones((pad * 2 + 1, pad * 2 + 1), np.uint8)
+    dilated = cv2.dilate(valid, kernel)
+    band = ((dilated > 0) & (valid == 0)).astype(np.uint8)
+    filled = _orig_cv2_inpaint(src, band, inpaintRadius, flags)
+    src2d = src if src.ndim == filled.ndim else src.squeeze(-1)
+    band_bool = band.astype(bool)
+    out = src2d.copy()
+    out[band_bool] = filled[band_bool]
+    return out
+cv2.inpaint = _bounded_cv2_inpaint
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+def free_vram():
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
+
+with open(r"{task_json}", "r") as f:
+    tasks = json.load(f)
+
+# TencentARC/Pixal3D's pipeline.json pins the rembg backend to the gated
+# briaai/RMBG-2.0 (same gate the TRELLIS.2 path already works around below) —
+# and Pixal3DImageTo3DPipeline.from_pretrained() instantiates it eagerly
+# regardless of whether our already-alpha-matted input ever calls it. Force
+# the public, ungated BiRefNet_HR checkpoint instead.
+from pixal3d.pipelines import rembg as _rembg
+_orig_birefnet_init = _rembg.BiRefNet.__init__
+def _patched_birefnet_init(self, model_name="ZhengPeng7/BiRefNet_HR", **kwargs):
+    _orig_birefnet_init(self, model_name="ZhengPeng7/BiRefNet_HR")
+_rembg.BiRefNet.__init__ = _patched_birefnet_init
+
+print("[3d] Loading pipeline...")
+print("[3d] Downloading checkpoint if not already cached (TencentARC/Pixal3D, ~24GB, first run only — this can take a while)...")
+pipe = Pixal3DImageTo3DPipeline.from_pretrained("TencentARC/Pixal3D")
+
+# "Proj mode" (pixel-aligned conditioning): from_pretrained() deliberately
+# leaves the four image_cond_model_* attrs as None — they must be built
+# externally. Configs match the reference TencentARC/Pixal3D inference.py
+# exactly, including the camenduru mirror of DINOv3 (pipeline.json points at
+# the gated facebook/dinov3-vitl16-pretrain-lvd1689m; this ungated mirror
+# avoids a 403 for users without Meta's DINOv3 access grant).
+from pixal3d.trainers.flow_matching.mixins.image_conditioned_proj import DinoV3ProjFeatureExtractor
+
+# Same bug (and same fix) as the stock TRELLIS.2 DinoV3FeatureExtractor patch
+# above: DinoV3ProjFeatureExtractor.extract_features() hard-codes
+# `self.model.layer`, but our pinned transformers version nests the
+# transformer blocks one level deeper, under `self.model.model.layer`
+# (DINOv3ViTModel.model is the DINOv3ViTEncoder). Unpatched, this raises
+# AttributeError the first time the Pixal3D backend actually runs. Confirmed
+# still present, unpatched, in TencentARC/Pixal3D upstream as of this writing.
+import torch.nn.functional as _F
+def _patched_proj_extract_features(self, image):
+    image = image.to(self.model.embeddings.patch_embeddings.weight.dtype)
+    hidden_states = self.model.embeddings(image, bool_masked_pos=None)
+    position_embeddings = self.model.rope_embeddings(image)
+    layers = getattr(self.model, "layer", None)
+    if layers is None:
+        layers = self.model.model.layer
+    for layer_module in layers:
+        hidden_states = layer_module(hidden_states, position_embeddings=position_embeddings)
+    return _F.layer_norm(hidden_states, hidden_states.shape[-1:])
+DinoV3ProjFeatureExtractor.extract_features = _patched_proj_extract_features
+
+_IMAGE_COND_CONFIGS = {{
+    "ss": dict(model_name="camenduru/dinov3-vitl16-pretrain-lvd1689m", image_size=512, grid_resolution=16),
+    "shape_512": dict(model_name="camenduru/dinov3-vitl16-pretrain-lvd1689m", image_size=512, grid_resolution=32,
+                       use_naf_upsample=True, naf_target_size=512),
+    "shape_1024": dict(model_name="camenduru/dinov3-vitl16-pretrain-lvd1689m", image_size=1024, grid_resolution=64,
+                        use_naf_upsample=True, naf_target_size=512),
+    "tex_1024": dict(model_name="camenduru/dinov3-vitl16-pretrain-lvd1689m", image_size=1024, grid_resolution=64,
+                      use_naf_upsample=True, naf_target_size=1024),
+}}
+
+def _build_image_cond_model(cfg):
+    m = DinoV3ProjFeatureExtractor(**cfg)
+    m.eval()
+    return m
+
+pipe.image_cond_model_ss = _build_image_cond_model(_IMAGE_COND_CONFIGS["ss"])
+pipe.image_cond_model_shape_512 = _build_image_cond_model(_IMAGE_COND_CONFIGS["shape_512"])
+pipe.image_cond_model_shape_1024 = _build_image_cond_model(_IMAGE_COND_CONFIGS["shape_1024"])
+pipe.image_cond_model_tex_1024 = _build_image_cond_model(_IMAGE_COND_CONFIGS["tex_1024"])
+
+# Low-VRAM mode (default True, matching the TRELLIS.2 path): models stay on
+# CPU and are moved to GPU on-demand per stage by the pipeline's own run()
+# logic. Only the NAF upsampler weights need pre-loading here (reference
+# TencentARC/Pixal3D inference.py does the same in its low_vram branch).
+pipe.low_vram = True
+for _attr in ("image_cond_model_ss", "image_cond_model_shape_512",
+              "image_cond_model_shape_1024", "image_cond_model_tex_1024"):
+    _m = getattr(pipe, _attr, None)
+    if _m is not None and getattr(_m, "use_naf_upsample", False):
+        _m._load_naf()
+pipe._device = torch.device(device)
+
+# Manual camera FOV/distance — Pixal3D's pixel back-projection requires
+# camera_params (no default fallback), but its own camera estimation (MoGe-2)
+# is trained on real photos, not the flat AI-generated illustrations this
+# add-on feeds it. Reproduce the reference inference.py's manual-FOV math
+# verbatim (its own recommended fallback when there's no real camera).
+def _compute_f_pixels(camera_angle_x, resolution):
+    focal_length = 16.0 / math.tan(camera_angle_x / 2.0)
+    return focal_length * resolution / 32.0
+
+def _distance_from_fov(camera_angle_x, grid_point, target_point, mesh_scale, image_resolution):
+    # Fixed axis-swap matching the reference implementation's world/grid convention.
+    xw, yw, zw = grid_point[0], -grid_point[2], grid_point[1]
+    xw, yw, zw = xw / mesh_scale / 2, yw / mesh_scale / 2, zw / mesh_scale / 2
+    xt, yt = target_point[0], target_point[1]
+    f_pixels = _compute_f_pixels(camera_angle_x, image_resolution)
+    x_ndc = xt - image_resolution / 2.0
+    return f_pixels * xw / x_ndc - yw
+
+_camera_angle_x = {scn.trellis_pixal_fov}
+_mesh_scale = {scn.trellis_pixal_mesh_scale}
+_image_resolution = 512
+_distance = _distance_from_fov(_camera_angle_x, (-1.0, 0.0, 0.0), (0 - 0, _image_resolution - 1 + 0), _mesh_scale, _image_resolution)
+camera_params = {{'camera_angle_x': _camera_angle_x, 'distance': _distance, 'mesh_scale': _mesh_scale}}
+print(f"[3d] Manual camera: fov={{math.degrees(_camera_angle_x):.1f}} deg, distance={{_distance:.4f}}, mesh_scale={{_mesh_scale}}")
+
+for idx, t in enumerate(tasks, 1):
+    print(f"[3d] Processing {{idx}}/{{len(tasks)}}")
+    # Load as RGBA — alpha mask from the 2D generation step lets the pipeline
+    # skip background removal and go straight to crop+premultiply.
+    img = Image.open(t["path"]).convert("RGBA")
+    out_meshes, (_shape_slat, _tex_slat, res) = pipe.run(
+        img,
+        camera_params=camera_params,
+        seed={scn.trellis_seed},
+        preprocess_image=True,
+        return_latent=True,
+        pipeline_type="{scn.trellis_pipeline_type}",
+        sparse_structure_sampler_params={{
+            "steps": {scn.trellis_ss_steps},
+            "guidance_strength": {scn.trellis_ss_guidance},
+            "guidance_rescale": {scn.trellis_ss_guidance_rescale},
+            "rescale_t": {scn.trellis_ss_rescale_t},
+        }},
+        shape_slat_sampler_params={{
+            "steps": {scn.trellis_shape_steps},
+            "guidance_strength": {scn.trellis_shape_guidance},
+            "guidance_rescale": {scn.trellis_shape_guidance_rescale},
+            "rescale_t": {scn.trellis_shape_rescale_t},
+        }},
+        tex_slat_sampler_params={{
+            "steps": {scn.trellis_tex_steps},
+            "guidance_strength": {scn.trellis_tex_guidance},
+            "guidance_rescale": {scn.trellis_tex_guidance_rescale},
+            "rescale_t": {scn.trellis_tex_rescale_t},
+        }},
+        max_num_tokens={scn.trellis_max_num_tokens},
+    )
+    mesh = out_meshes[0]
+    mesh.simplify(16777216)  # nvdiffrast face limit
+    glb_p = t["path"].replace(".png", "_3d.glb")
+    glb = o_voxel.postprocess.to_glb(
+        vertices=mesh.vertices,
+        faces=mesh.faces,
+        attr_volume=mesh.attrs,
+        coords=mesh.coords,
+        attr_layout=pipe.pbr_attr_layout,
+        grid_size=res,
+        aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+        remesh=True,
+        remesh_band=1,
+        remesh_project=0,
+        texture_size=4096,
+        mesh_cluster_refine_iterations=100,
+        mesh_cluster_global_iterations=3,
+        use_tqdm=True,
+    )
+    # Axis correction matching the reference TencentARC/Pixal3D inference.py —
+    # Pixal3D's coordinate convention differs from stock TRELLIS.2's export.
+    _rot = np.array([
+        [-1,  0,  0,  0],
+        [ 0,  0, -1,  0],
+        [ 0, -1,  0,  0],
+        [ 0,  0,  0,  1],
+    ], dtype=np.float64)
+    glb.apply_transform(_rot)
+    glb.export(glb_p, extension_webp=True)
+
+    del img, out_meshes, _shape_slat, _tex_slat, res, mesh, glb
+    free_vram()
+
+del pipe
+free_vram()
+print("[3d] Done.")
+"""
 
 # --- BAKE TEXTURE TO VERTEX COLORS ---
-
-class TRELLIS_OT_BakeVertexColors(Operator):
-    bl_idname = "object.bake_texture_to_vertex_colors"
-    bl_label = "Bake Texture to Vertex Colors"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def execute(self, context):
-        selected = [o for o in context.selected_objects if o.type == 'MESH']
-        if not selected:
-            self.report({'ERROR'}, "No mesh selected.")
-            return {'CANCELLED'}
-
-        scene = context.scene
-        prev_engine = scene.render.engine
-        scene.render.engine = 'CYCLES'
-        try:
-            for obj in selected:
-                mesh = obj.data
-                color_attr = mesh.color_attributes.get("Col")
-                if color_attr is None:
-                    color_attr = mesh.color_attributes.new(name="Col", type='BYTE_COLOR', domain='CORNER')
-                mesh.color_attributes.active_color = color_attr
-                context.view_layer.objects.active = obj
-                obj.select_set(True)
-                # DIFFUSE + COLOR-only pass filter bakes the flat albedo (the
-                # image texture's color), ignoring scene lighting entirely —
-                # target='VERTEX_COLORS' writes straight into the color
-                # attribute above instead of a separate image.
-                with context.temp_override(selected_editable_objects=[obj], active_object=obj, object=obj):
-                    bpy.ops.object.bake(type='DIFFUSE', pass_filter={'COLOR'}, target='VERTEX_COLORS')
-        except RuntimeError as e:
-            self.report({'ERROR'}, f"Bake failed: {e}")
-            return {'CANCELLED'}
-        finally:
-            scene.render.engine = prev_engine
-
-        self.report({'INFO'}, f"Baked {len(selected)} mesh(es) to vertex colors.")
-        return {'FINISHED'}
 
 # --- PRO ASYNC INSTALLER ---
 
@@ -1677,9 +2610,16 @@ class TRELLIS_PT_SubPanel(Panel):
     def draw(self, context):
         scene = context.scene
         layout = self.layout
+        layout.prop(scene, "trellis_model_backend")
         layout.operator("object.trellis_convert", text="Convert Selected to 3D", icon='MOD_MESHDEFORM')
         draw_progress(layout, "infer_3d")
-        layout.operator("object.bake_texture_to_vertex_colors", text="Bake Texture to Vertex Colors")
+
+        is_pixal3d = scene.trellis_model_backend == "PIXAL3D"
+        if is_pixal3d:
+            cam_box = layout.box()
+            cam_box.label(text="Camera (manual — no real camera to estimate from)", icon='CAMERA_DATA')
+            cam_box.prop(scene, "trellis_pixal_fov")
+            cam_box.prop(scene, "trellis_pixal_mesh_scale")
 
         box = layout.box()
         row = box.row()
@@ -1698,24 +2638,30 @@ class TRELLIS_PT_SubPanel(Panel):
         col.prop(scene, "trellis_ss_steps")
         col.prop(scene, "trellis_ss_guidance")
         col.prop(scene, "trellis_ss_guidance_rescale")
+        if is_pixal3d:
+            col.prop(scene, "trellis_ss_rescale_t")
 
         col = box.column(align=True)
         col.label(text="Shape:")
         col.prop(scene, "trellis_shape_steps")
         col.prop(scene, "trellis_shape_guidance")
         col.prop(scene, "trellis_shape_guidance_rescale")
+        if is_pixal3d:
+            col.prop(scene, "trellis_shape_rescale_t")
 
         col = box.column(align=True)
         col.label(text="Texture:")
         col.prop(scene, "trellis_tex_steps")
         col.prop(scene, "trellis_tex_guidance")
         col.prop(scene, "trellis_tex_guidance_rescale")
+        if is_pixal3d:
+            col.prop(scene, "trellis_tex_rescale_t")
 
 # --- REGISTRATION ---
 
 classes = (
     Import_Text_Props, AssetGeneratorPreferences,
-    ZIMAGE_OT_GenerateAsset, TRELLIS_OT_ConvertSelected, TRELLIS_OT_BakeVertexColors,
+    ZIMAGE_OT_GenerateAsset, TRELLIS_OT_ConvertSelected,
     InstallOperator, UninstallOperator,
     ZIMAGE_PT_MainPanel, TRELLIS_PT_SubPanel
 )
@@ -1726,6 +2672,32 @@ classes = (
 # where noted as the pipeline's own stock config.
 _TRELLIS_SCENE_PROPS = {
     "trellis_show_settings": (BoolProperty, dict(name="Advanced Settings", default=False)),
+    "trellis_model_backend": (EnumProperty, dict(
+        name="Model",
+        description="3D generation backbone. Pixal3D adds pixel-aligned back-projection "
+                    "conditioning (from TencentARC/Pixal3D) for closer fidelity to the input "
+                    "image, at the cost of a large extra checkpoint download and a manual "
+                    "camera FOV guess (see below) since it has no real camera to estimate from",
+        default="TRELLIS2",
+        items=[
+            ("TRELLIS2", "TRELLIS.2", "Stock microsoft/TRELLIS.2-4B — proven, no camera params needed"),
+            ("PIXAL3D", "Pixal3D", "TencentARC/Pixal3D — pixel-aligned conditioning, needs a manual FOV guess"),
+        ],
+    )),
+    # Radians. 0.2 matches Pixal3D's own suggested fallback value ("Try 0.2 rad if you
+    # notice distortion") for when there's no real camera to estimate FOV from — exactly
+    # this addon's situation, since inputs are flat AI-generated illustrations, not photos.
+    "trellis_pixal_fov": (FloatProperty, dict(
+        name="Camera FOV", subtype='ANGLE',
+        description="Manual horizontal FOV fed to Pixal3D's pixel back-projection, in place "
+                    "of MoGe-2's photo-based camera estimation (not used here — these inputs "
+                    "have no real camera to estimate from). Lower values approximate a more "
+                    "distant/orthographic-like camera",
+        default=0.2, min=0.01, max=3.0,
+    )),
+    "trellis_pixal_mesh_scale": (FloatProperty, dict(
+        name="Mesh Scale", default=1.0, min=0.01, max=10.0,
+    )),
     "trellis_pipeline_type": (EnumProperty, dict(
         name="Resolution", default="1536_cascade",
         items=[
@@ -1745,9 +2717,13 @@ _TRELLIS_SCENE_PROPS = {
     "trellis_ss_steps": (IntProperty, dict(name="Steps", default=12, min=1, max=50)),
     "trellis_ss_guidance": (FloatProperty, dict(name="Guidance Strength", default=7.5, min=0.0, max=20.0)),
     "trellis_ss_guidance_rescale": (FloatProperty, dict(name="Guidance Rescale", default=0.7, min=0.0, max=1.0)),
+    # rescale_t: Pixal3D-only sampler param (its reference inference.py default). Not
+    # passed to the stock TRELLIS2 call, which has no such key.
+    "trellis_ss_rescale_t": (FloatProperty, dict(name="Rescale T (Pixal3D)", default=5.0, min=0.0, max=20.0)),
     "trellis_shape_steps": (IntProperty, dict(name="Steps", default=28, min=1, max=50)),
     "trellis_shape_guidance": (FloatProperty, dict(name="Guidance Strength", default=7.5, min=0.0, max=20.0)),
     "trellis_shape_guidance_rescale": (FloatProperty, dict(name="Guidance Rescale", default=0.5, min=0.0, max=1.0)),
+    "trellis_shape_rescale_t": (FloatProperty, dict(name="Rescale T (Pixal3D)", default=3.0, min=0.0, max=20.0)),
     "trellis_tex_steps": (IntProperty, dict(name="Steps", default=28, min=1, max=50)),
     # 2.0 (stock: 1.0 = CFG off) for stronger adherence to the input image.
     "trellis_tex_guidance": (FloatProperty, dict(name="Guidance Strength", default=2.0, min=0.0, max=20.0)),
@@ -1755,6 +2731,7 @@ _TRELLIS_SCENE_PROPS = {
     # guidance_strength > 1 (stock tex default is 0.0, matching stock's
     # CFG-off guidance_strength of 1.0).
     "trellis_tex_guidance_rescale": (FloatProperty, dict(name="Guidance Rescale", default=0.7, min=0.0, max=1.0)),
+    "trellis_tex_rescale_t": (FloatProperty, dict(name="Rescale T (Pixal3D)", default=3.0, min=0.0, max=20.0)),
 }
 
 def register():

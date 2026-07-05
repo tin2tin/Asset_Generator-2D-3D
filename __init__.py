@@ -1305,9 +1305,16 @@ def texts_callback(self, context):
 class Import_Text_Props(PropertyGroup):
     def update_text_list(self, context):
         if self.scene_texts in bpy.data.texts: self.script = bpy.data.texts[self.scene_texts].name
-    input_type: EnumProperty(name="Input Type", items=[("PROMPT", "Prompt", ""), ("TEXT_BLOCK", "Text-Block", "")], default="TEXT_BLOCK")
+    input_type: EnumProperty(name="Input Type", items=[("PROMPT", "Prompt", ""), ("TEXT_BLOCK", "Text-Block", ""), ("FILE", "File", "")], default="TEXT_BLOCK")
     script: StringProperty(default="")
     scene_texts: EnumProperty(name="Text-Blocks", items=texts_callback, update=update_text_list)
+    # FILE input: an existing image supplied by the user instead of a prompt.
+    # It skips the Z-Image 2D generation step but is otherwise processed
+    # identically (BiRefNet background removal, per-object crop, plane import).
+    # No subtype='FILE_PATH' — that would render a second, built-in browse
+    # button next to our explicit FILE_FOLDER one. bpy.path.abspath() in
+    # execute() still resolves any // or ~ prefix at run time.
+    input_image: StringProperty(name="Image", default="")
 
 def get_unique_name(self, context):
     base = context.scene.asset_name or "Asset"
@@ -1687,7 +1694,16 @@ class ZIMAGE_OT_GenerateAsset(Operator):
         activate_virtualenv()
         py = python_exec()
         props = context.scene.import_text
-        if props.input_type == "PROMPT":
+        # FILE mode supplies an existing image and skips 2D generation entirely;
+        # input_image_path is injected into the isolated script (empty => generate).
+        input_image_path = ""
+        if props.input_type == "FILE":
+            input_image_path = bpy.path.abspath(props.input_image) if props.input_image else ""
+            if not input_image_path or not os.path.isfile(input_image_path):
+                self.report({'ERROR'}, "Select a valid input image file.")
+                return {'CANCELLED'}
+            lines = []
+        elif props.input_type == "PROMPT":
             lines = [context.scene.asset_prompt]
         else:
             text = bpy.data.texts.get(props.scene_texts)
@@ -1697,9 +1713,15 @@ class ZIMAGE_OT_GenerateAsset(Operator):
             lines = [l.body for l in text.lines if l.body.strip()]
         lines = [sanitize_text(l).strip() for l in lines]
         lines = [l for l in lines if l]
-        if not lines:
+        if not lines and not input_image_path:
             self.report({'ERROR'}, "No prompt text to generate from.")
             return {'CANCELLED'}
+
+        # name_base names the imported plane object(s). For FILE input with no
+        # explicit asset name, fall back to the image's filename stem.
+        name_base = context.scene.asset_name or "Asset"
+        if input_image_path and not context.scene.asset_name:
+            name_base = os.path.splitext(os.path.basename(input_image_path))[0] or "Asset"
 
         data_dir = os.path.join(bpy.utils.user_resource("DATAFILES"), "2D_Async_Queue")
         os.makedirs(data_dir, exist_ok=True)
@@ -1747,7 +1769,9 @@ from torchvision import transforms
 
 device = "cuda"
 lines = {json.dumps(lines)}
-name_base = "{context.scene.asset_name or 'Asset'}"
+name_base = {json.dumps(name_base)}
+# Non-empty => FILE mode: use this image directly and skip 2D generation.
+input_image_path = {json.dumps(input_image_path)}
 
 def free_vram():
     gc.collect()
@@ -1759,34 +1783,44 @@ def free_vram():
 # with only the pipeline loaded (and CPU-offloaded), then the pipeline is fully
 # released; Phase 2 loads the segmenter and processes the images saved to disk.
 
-# --- PHASE 1: generate all images (only the diffusion pipeline in VRAM) -------
-print("[2d] Loading pipeline...")
-pipe = ZImagePipeline.from_pretrained("Tongyi-MAI/Z-Image-Turbo", torch_dtype=torch.bfloat16)
-# enable_model_cpu_offload keeps only the actively-running submodule on the GPU
-# and parks the rest in CPU RAM — a big VRAM saving. It manages device
-# placement itself, so we must NOT also call .to(device).
-try:
-    pipe.enable_model_cpu_offload()
-except Exception as _e:
-    print(f"[2d] CPU offload unavailable ({{_e}}); falling back to full GPU load")
-    pipe.to(device)
-
+# --- PHASE 1: obtain the raw image(s) (only the diffusion pipeline in VRAM) ----
 raw_paths = []  # (index, path-to-raw-RGB-png)
-for i, line in enumerate(lines):
-    print(f"[2d] Generating: {{line}}")
-    # 2048 instead of Z-Image's native 1024: the segmented per-object crops
-    # are what feed TRELLIS later, and crops from a 1024 sheet sit far below
-    # TRELLIS's 1024px input ceiling. Doubling the sheet doubles each crop.
-    img = pipe(prompt="neutral background, " + line, height=2048, width=2048,
-               num_inference_steps=9, guidance_scale=0.0).images[0]
-    raw_p = os.path.join(r"{data_dir}", f"{{name_base}}_{{i}}_raw.png")
-    img.convert("RGB").save(raw_p)
-    raw_paths.append((i, raw_p))
-    torch.cuda.empty_cache()
+if input_image_path:
+    # FILE mode: use the user's image directly — no generation, no pipeline load.
+    # Copy it into the queue dir as the "raw" image so Phase 2 processes (and
+    # later deletes) the copy, never the user's original file.
+    print("[2d] Using input image (skipping generation)...")
+    _src0 = Image.open(input_image_path).convert("RGB")
+    raw_p = os.path.join(r"{data_dir}", f"{{name_base}}_0_raw.png")
+    _src0.save(raw_p)
+    raw_paths.append((0, raw_p))
+else:
+    print("[2d] Loading pipeline...")
+    pipe = ZImagePipeline.from_pretrained("Tongyi-MAI/Z-Image-Turbo", torch_dtype=torch.bfloat16)
+    # enable_model_cpu_offload keeps only the actively-running submodule on the GPU
+    # and parks the rest in CPU RAM — a big VRAM saving. It manages device
+    # placement itself, so we must NOT also call .to(device).
+    try:
+        pipe.enable_model_cpu_offload()
+    except Exception as _e:
+        print(f"[2d] CPU offload unavailable ({{_e}}); falling back to full GPU load")
+        pipe.to(device)
 
-# Release the diffusion pipeline BEFORE loading the segmenter.
-del pipe
-free_vram()
+    for i, line in enumerate(lines):
+        print(f"[2d] Generating: {{line}}")
+        # 2048 instead of Z-Image's native 1024: the segmented per-object crops
+        # are what feed TRELLIS later, and crops from a 1024 sheet sit far below
+        # TRELLIS's 1024px input ceiling. Doubling the sheet doubles each crop.
+        img = pipe(prompt="neutral background, " + line, height=2048, width=2048,
+                   num_inference_steps=9, guidance_scale=0.0).images[0]
+        raw_p = os.path.join(r"{data_dir}", f"{{name_base}}_{{i}}_raw.png")
+        img.convert("RGB").save(raw_p)
+        raw_paths.append((i, raw_p))
+        torch.cuda.empty_cache()
+
+    # Release the diffusion pipeline BEFORE loading the segmenter.
+    del pipe
+    free_vram()
 
 # --- PHASE 2: segment + crop (only BiRefNet in VRAM) --------------------------
 print("[2d] Loading BiRefNet...")
@@ -1843,7 +1877,7 @@ print("[2d] Done.")
             encoding="utf-8", errors="replace",
         )
         _track_subprocess(self._process)
-        self._reader = threading.Thread(target=_read_2d_progress, args=(self._process, len(lines)), daemon=True)
+        self._reader = threading.Thread(target=_read_2d_progress, args=(self._process, max(len(lines), 1)), daemon=True)
         self._reader.start()
         self._timer = context.window_manager.event_timer_add(0.2, window=context.window)
         context.window_manager.modal_handler_add(self)
@@ -2612,6 +2646,26 @@ class UninstallOperator(Operator):
 
 # --- UI PANELS ---
 
+class ZIMAGE_OT_SelectInputImage(Operator):
+    """Open a file browser to pick an image to convert into a 2D asset."""
+    bl_idname = "object.select_input_image"
+    bl_label = "Select Image"
+    bl_options = {"INTERNAL"}
+
+    filepath: StringProperty(subtype='FILE_PATH')
+    filter_glob: StringProperty(
+        default="*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff;*.webp;*.exr",
+        options={'HIDDEN'},
+    )
+
+    def execute(self, context):
+        context.scene.import_text.input_image = self.filepath
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
 class ZIMAGE_PT_MainPanel(Panel):
     bl_label = "Asset Generator"
     bl_idname = "VIEW3D_PT_zimage"
@@ -2625,6 +2679,11 @@ class ZIMAGE_PT_MainPanel(Panel):
             row = box.row(align=True)
             row.prop(props, "scene_texts", text="", icon="TEXT")
             row.prop(props, "script", text="")
+        elif props.input_type == "FILE":
+            row = box.row(align=True)
+            row.prop(props, "input_image", text="")
+            row.operator("object.select_input_image", text="", icon='FILE_FOLDER')
+            box.prop(scene, "asset_name", text="Name")
         else:
             box.prop(scene, "asset_prompt", text="Prompt")
             box.prop(scene, "asset_name", text="Name")
@@ -2689,7 +2748,7 @@ class TRELLIS_PT_SubPanel(Panel):
 
 classes = (
     Import_Text_Props, AssetGeneratorPreferences,
-    ZIMAGE_OT_GenerateAsset, TRELLIS_OT_ConvertSelected,
+    ZIMAGE_OT_GenerateAsset, ZIMAGE_OT_SelectInputImage, TRELLIS_OT_ConvertSelected,
     InstallOperator, UninstallOperator,
     ZIMAGE_PT_MainPanel, TRELLIS_PT_SubPanel
 )

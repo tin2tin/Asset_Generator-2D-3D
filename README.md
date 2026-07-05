@@ -8,7 +8,9 @@ A Blender add-on that generates 2D billboard/concept assets from text prompts an
 
 <img width="392" height="236" alt="image" src="https://github.com/user-attachments/assets/0cd52374-47d1-41e3-ab19-87edba19715f" />
 
-- **3D conversion**: selected image-plane assets are sent through [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) (Microsoft's image-to-3D pipeline) to produce a textured `.glb` mesh, imported back into the scene next to the source plane.
+- **3D conversion**: selected image-plane assets are sent through an image-to-3D pipeline to produce a textured `.glb` mesh, imported back into the scene next to the source plane. Two backends are selectable:
+  - [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) (Microsoft, `TRELLIS.2-4B`) — the default; proven, needs no camera parameters.
+  - [Pixal3D](https://github.com/TencentARC/Pixal3D) (TencentARC) — pixel-aligned conditioning that better preserves fine surface detail, at the cost of a manual camera FOV guess (there's no real camera to estimate from for flat AI illustrations).
 
 <img width="394" height="96" alt="image" src="https://github.com/user-attachments/assets/8d0c561e-8303-4fbc-a77c-5384acdbeb72" />
 
@@ -18,7 +20,7 @@ Both stages run in isolated background subprocesses with their own progress bar,
 
 - Windows, Blender 5.2 (bundled Python 3.13).
 - An NVIDIA GPU with a recent driver (CUDA 12.8 runtime is installed automatically as part of the dependency setup — no separate CUDA Toolkit install is required to *run* the add-on).
-- ~10–15 GB of free disk space for the model weights, CUDA-enabled PyTorch, and the TRELLIS.2 runtime.
+- ~10–15 GB of free disk space for the model weights, CUDA-enabled PyTorch, and the TRELLIS.2 runtime. The optional Pixal3D backend downloads an additional ~24 GB checkpoint (`TencentARC/Pixal3D`) the first time it's used.
 - 2D generation alone needs no extra setup beyond the dependency install below. 3D conversion additionally needs the compiled CUDA extensions (`o-voxel`, `cumesh`, `flexgemm`, `nvdiffrast`, `flash_attn`) — prebuilt wheels for these are bundled or fetched automatically (see [Prebuilt CUDA extensions](#prebuilt-cuda-extensions) below), so end users do **not** need a CUDA Toolkit or MSVC install for this either.
 
 ## Installation
@@ -30,7 +32,7 @@ Both stages run in isolated background subprocesses with their own progress bar,
 3. Open its preferences and click **"Install Dependencies"**. This runs in the background and:
    - Installs a CUDA-enabled PyTorch build (`torch==2.9.1+cu128`) into an isolated `addon_packages/` folder (added to `sys.path` at runtime — it does not touch Blender's own Python environment).
    - Installs the full pinned dependency set from `requirements.txt`.
-   - Clones the `TRELLIS.2` repo (for the 3D pipeline code).
+   - Clones the `TRELLIS.2` and `Pixal3D` repos (for the 3D pipeline code).
    - Installs the compiled CUDA extensions from prebuilt wheels (falling back to a from-source build only if no matching wheel is found).
 4. Watch progress in the Preferences panel and the system console. When it reports "Done — CUDA OK", you're ready to generate.
 
@@ -47,10 +49,12 @@ Both panels live in the 3D Viewport sidebar, under the **"2D Asset"** tab.
 2. Click **"Generate 2D Assets"**.
 3. Each generated image is background-removed, split into per-object crops if it contains multiple subjects, and imported as an upright image-plane object with a transparent material, marked as a Blender asset with a thumbnail preview.
 
-### 3D Trellis Conversion
+### 3D Conversion
 1. Select one or more of the generated 2D image-plane assets in the viewport.
-2. Click **"Convert Selected to 3D"**.
-3. Each selected plane's texture is run through TRELLIS.2; the resulting textured mesh is imported as a `.glb` next to the original plane.
+2. Pick a **backend** — **TRELLIS.2** (default) or **Pixal3D**. For Pixal3D, set the **Camera FOV** (0.2 rad is a sane default for flat illustrations) and **Mesh Scale** in the camera box that appears.
+3. Click **"Convert Selected to 3D"**.
+4. Each selected plane's texture is run through the chosen backend; the resulting textured mesh is imported as a `.glb` next to the original plane.
+5. Optionally expand **Advanced Settings** to tune the sparse-structure / shape / texture sampler steps, guidance, seed, and max token budget per stage.
 
 ## How it works
 
@@ -79,4 +83,5 @@ Built on top of:
 - [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) (Tongyi-MAI) for 2D image generation.
 - [BiRefNet_HR](https://huggingface.co/ZhengPeng7/BiRefNet_HR) (ZhengPeng7) for background removal / segmentation.
 - [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) (Microsoft) for image-to-3D mesh generation.
+- [Pixal3D](https://github.com/TencentARC/Pixal3D) (TencentARC) as the alternative pixel-aligned image-to-3D backend.
 - [PozzettiAndrea/cuda-wheels](https://github.com/PozzettiAndrea/cuda-wheels) for prebuilt Windows CUDA extension wheels.
